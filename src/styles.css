@@ -5,3 +5,5 @@
 /* Fixed light workspace layout */
 .toast{color:var(--text);box-shadow:0 10px 35px #3a30431a}
 @media(max-height:800px){.content{padding-top:16px;padding-bottom:16px}.hero h2{font-size:24px;margin-top:12px}.dropzone{min-height:120px}.panel-head{padding-top:11px;padding-bottom:9px}.mode-tabs{padding-bottom:9px}.controls{padding-top:10px;padding-bottom:11px}}
+
+.results-actions{display:flex;gap:8px;align-items:center}.result-card .download-file{margin-top:7px;padding:0}
