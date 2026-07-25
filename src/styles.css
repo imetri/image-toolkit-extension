@@ -10,3 +10,12 @@
 
 /* shadcn Sidebar 7-inspired workspace rail */
 .sidebar{position:sticky;top:0;align-self:flex-start;width:258px;height:100vh;padding:0 12px;border-right:1px solid var(--border);background:var(--surface);transition:width .2s ease;z-index:10}.sidebar-header{height:72px;display:flex;align-items:center;justify-content:space-between;padding:0 8px;border-bottom:1px solid var(--border)}.sidebar-header .brand{padding:0;gap:9px}.brand-name{font-size:15px}.sidebar-toggle{width:30px;height:30px;border:1px solid transparent;border-radius:7px;background:transparent;color:var(--muted);display:grid;place-items:center;cursor:pointer}.sidebar-toggle:hover{background:var(--surface-2);color:var(--text)}.sidebar-content{padding:20px 6px;overflow-y:auto}.sidebar-group{display:flex;flex-direction:column;gap:3px}.sidebar-content .side-label{padding:0 10px 9px;font-size:10px}.sidebar-content .nav-item{height:38px;margin:0;padding:0 10px;gap:11px}.sidebar-content .nav-item svg{flex:none}.sidebar-footer{padding:12px 6px 16px;margin-top:auto;border-top:1px solid var(--border)}.sidebar-footer .privacy{padding:12px 10px;margin:0 0 10px;border:0}.sidebar-footer .profile{padding:8px 10px}.sidebar-collapsed .sidebar{width:76px}.sidebar-collapsed .sidebar-header{justify-content:center;padding:0 4px}.sidebar-collapsed .sidebar-header .brand{gap:0}.sidebar-collapsed .brand-name,.sidebar-collapsed .version,.sidebar-collapsed .nav-text,.sidebar-collapsed .side-label,.sidebar-collapsed .nav-count{display:none}.sidebar-collapsed .sidebar-content{padding-left:4px;padding-right:4px}.sidebar-collapsed .sidebar-content .nav-item{justify-content:center;padding:0}.sidebar-collapsed .sidebar-footer{padding-left:4px;padding-right:4px}.sidebar-collapsed .sidebar-footer .privacy,.sidebar-collapsed .sidebar-footer .profile{justify-content:center;padding-left:0;padding-right:0}.sidebar-collapsed .sidebar-footer .status-dot{display:none}.sidebar-collapsed .main{min-width:0}
+ .enter-key{display:none}
+ .drop-hint{font-size:0}
+ .drop-hint::before{content:'PNG · JPG · WebP · AVIF';font:9px Inter}
+ .drop-hint i{display:none}
+ .eyebrow{display:none}
+ .topbar h1{display:none}
+ .step{display:none}
+ .process-btn{color:#fff}
+ .sidebar-footer .privacy{display:none}
