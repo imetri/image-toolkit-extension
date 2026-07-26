@@ -35,7 +35,12 @@ In Chrome, open `chrome://extensions`, enable Developer mode, choose **Load unpa
 Lossy formats are encoded at maximum quality for Convert and Resize. The
 adjustable quality value is applied only to Compress. RAW decoding runs inside a
 sandboxed local extension page so LibRaw can execute without giving it access to
-Chrome extension APIs.
+Chrome extension APIs. RAW-to-PNG conversion uses full-resolution, 16-bit
+LibRaw output and a direct 16-bit PNG encoder; it does not pass through the
+browser's 8-bit canvas or silently substitute an embedded JPEG preview. RAW
+development also applies DCB demosaicing, light pre-demosaic noise cleanup,
+highlight blending, color-artifact suppression, and restrained 16-bit capture
+sharpening.
 
 Premium readiness is intentionally represented at the workflow boundary: each future operation can be modeled as a typed operation and checked before `processImage` is called. Payments and account state are not included in the MVP.
 

@@ -1,4 +1,5 @@
 import LibRawModule from 'libraw-wasm/dist/libraw.js'
+import librawWasmDataUrl from 'libraw-wasm/dist/libraw.wasm?raw-inline'
 
 const CHANNEL = 'imageflow-raw-decoder'
 
@@ -31,7 +32,20 @@ type LibRawRuntime = {
   LibRaw: new () => LibRawInstance
 }
 
-const runtime = LibRawModule() as Promise<LibRawRuntime>
+function decodeDataUrl(dataUrl: string) {
+  const separator = dataUrl.indexOf(',')
+  if (separator < 0 || !dataUrl.slice(0, separator).includes(';base64')) {
+    throw new Error('The embedded RAW decoder is invalid.')
+  }
+  const binary = atob(dataUrl.slice(separator + 1))
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
+  return bytes
+}
+
+const runtime = LibRawModule({
+  wasmBinary:decodeDataUrl(librawWasmDataUrl),
+}) as Promise<LibRawRuntime>
 const active = new Map<string, LibRawInstance>()
 
 const reply = (message: object, transfer: Transferable[] = []) => {
@@ -59,9 +73,15 @@ window.addEventListener('message', event => {
         useCameraWb:true,
         useCameraMatrix:1,
         outputColor:1,
-        outputBps:8,
+        outputBps:16,
         userFlip:-1,
-        userQual:3,
+        userQual:4,
+        highlight:2,
+        greenMatching:true,
+        dcbIterations:2,
+        dcbEnhanceFl:true,
+        fbddNoiserd:1,
+        medPasses:1,
       })
       const image = decoder.imageData()
       if (active.get(message.id) !== decoder) return

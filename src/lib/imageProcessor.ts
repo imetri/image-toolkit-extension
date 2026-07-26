@@ -1,7 +1,9 @@
 import type { ImageItem, ProcessOptions, ProcessedItem } from '../types'
 import { extensionFor, newId, outputMime } from './utils'
-import { extractRawPreview, isRawImage } from './imageFormats'
+import { isRawImage } from './imageFormats'
 import { decodeRawImage } from './rawDecoder'
+import { encodeRawPng16 } from './pngEncoder'
+import { applyRawCaptureSharpening } from './rawEnhance'
 
 const abortError = () => new DOMException('Image processing was cancelled', 'AbortError')
 
@@ -71,17 +73,8 @@ function rawPixelsToCanvas(
 }
 
 async function decodeRawSource(file: File, signal?: AbortSignal) {
-  try {
-    const fullImage = await decodeRawImage(file, signal)
-    return { image:rawPixelsToCanvas(fullImage, signal) }
-  } catch (error) {
-    if (signal?.aborted) throw error
-    const preview = await extractRawPreview(file, signal)
-    return {
-      image:await decode(preview, signal),
-      warning:'Embedded preview used; this RAW variant could not be fully decoded.',
-    }
-  }
+  const fullImage = applyRawCaptureSharpening(await decodeRawImage(file, signal), signal)
+  return { image:rawPixelsToCanvas(fullImage, signal) }
 }
 
 export async function processImage(item: ImageItem, options: ProcessOptions, signal?: AbortSignal): Promise<ProcessedItem> {
@@ -91,6 +84,24 @@ export async function processImage(item: ImageItem, options: ProcessOptions, sig
     ? 'image/jpeg'
     : outputMime(options.format, item.file.type)
   const originalMime = item.file.type === 'image/jpg' ? 'image/jpeg' : item.file.type
+  if (raw && requestedMime === 'image/png' && options.operation !== 'resize') {
+    const decoded = applyRawCaptureSharpening(await decodeRawImage(item.file, signal), signal)
+    const blob = await encodeRawPng16(decoded, signal)
+    const base = item.file.name.replace(/\.[^/.]+$/, '')
+    return {
+      id:newId(),
+      sourceName:item.file.name,
+      name:`${base}.png`,
+      blob,
+      preview:URL.createObjectURL(blob),
+      originalSize:item.file.size,
+      outputSize:blob.size,
+      width:decoded.width,
+      height:decoded.height,
+      bitDepth:16,
+      status:'done',
+    }
+  }
   if (!raw && options.operation === 'convert' && originalMime === requestedMime) {
     const blob = item.file.slice(0, item.file.size, requestedMime)
     return {
@@ -123,5 +134,5 @@ export async function processImage(item: ImageItem, options: ProcessOptions, sig
   const mime = blob.type || requestedMime
   const base = item.file.name.replace(/\.[^/.]+$/, '')
   const name = `${base}.${extensionFor(mime)}`
-  return { id:newId(), sourceName:item.file.name, name, blob, preview:URL.createObjectURL(blob), originalSize:item.file.size, outputSize:blob.size, width, height, warning:rawSource?.warning, status:'done' }
+  return { id:newId(), sourceName:item.file.name, name, blob, preview:URL.createObjectURL(blob), originalSize:item.file.size, outputSize:blob.size, width, height, status:'done' }
 }
