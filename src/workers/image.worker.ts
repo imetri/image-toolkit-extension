@@ -14,9 +14,10 @@ workerScope.onmessage = async ({ data }: MessageEvent<WorkerRequest>) => {
     const canvas = new OffscreenCanvas(width, height)
     canvas.getContext('2d')!.drawImage(bitmap, 0, 0, width, height)
     const mime = outputMime(options.format, item.file.type)
-    const blob = await canvas.convertToBlob({ type:mime, quality:options.quality / 100 })
+    const quality = options.operation === 'compress' ? options.quality / 100 : 1
+    const blob = await canvas.convertToBlob(mime === 'image/png' ? { type:mime } : { type:mime, quality })
     const base = item.file.name.replace(/\.[^/.]+$/, '')
-    const result: Omit<ProcessedItem, 'preview'> = { id:newId(), sourceName:item.file.name, name:`${base}.${extensionFor(mime)}`, blob, originalSize:item.file.size, outputSize:blob.size, status:'done' }
+    const result: Omit<ProcessedItem, 'preview'> = { id:newId(), sourceName:item.file.name, name:`${base}.${extensionFor(blob.type || mime)}`, blob, originalSize:item.file.size, outputSize:blob.size, width, height, status:'done' }
     workerScope.postMessage(result)
     bitmap.close()
   } catch (error) { workerScope.postMessage({ error: error instanceof Error ? error.message : 'Unable to process image' }) }

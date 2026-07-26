@@ -4,7 +4,9 @@ ImageFlow is a privacy-first Chrome Extension for fast batch image workflows. It
 
 ## MVP
 
-- Batch drag-and-drop intake for PNG, JPG/JPEG, WebP, and AVIF.
+- Batch drag-and-drop intake for every image format Chrome can decode, plus local
+  full-resolution sensor decoding for major camera RAW families through LibRaw
+  (including DNG, CR2/CR3, NEF/NRW, ARW/SR2/SRF, RAF, ORF, RW2, PEF, and SRW).
 - Convert to PNG, JPG, WebP, or AVIF.
 - Resize by width, height, or percentage with optional aspect-ratio locking.
 - Compress with an adjustable quality control.
@@ -29,6 +31,11 @@ In Chrome, open `chrome://extensions`, enable Developer mode, choose **Load unpa
 ## Architecture
 
 `src/App.tsx` owns the product flow and presentation composition. `src/components` contains reusable UI primitives, `src/hooks` contains queue state, and `src/lib` contains pure-ish image and formatting utilities. The processing boundary is isolated in `imageProcessor.ts`, making it straightforward to move encoding into a worker or add future pipeline stages.
+
+Lossy formats are encoded at maximum quality for Convert and Resize. The
+adjustable quality value is applied only to Compress. RAW decoding runs inside a
+sandboxed local extension page so LibRaw can execute without giving it access to
+Chrome extension APIs.
 
 Premium readiness is intentionally represented at the workflow boundary: each future operation can be modeled as a typed operation and checked before `processImage` is called. Payments and account state are not included in the MVP.
 

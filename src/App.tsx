@@ -7,19 +7,67 @@ import { Archive, ArrowDownToLine, ArrowLeftRight, Check, ChevronDown, CircleMin
 import { Button, Toggle } from './components/ui'
 import { useImageQueue } from './hooks/useImageQueue'
 import { processImage } from './lib/imageProcessor'
-import { formatBytes, newId } from './lib/utils'
+import { IMAGE_FILE_ACCEPT } from './lib/imageFormats'
+import { formatBytes } from './lib/utils'
 import type { Operation, OutputFormat, ProcessedItem } from './types'
 
 const schema = z.object({ width:z.coerce.number().min(1).optional(), height:z.coerce.number().min(1).optional(), percentage:z.coerce.number().min(1).max(1000).optional(), quality:z.coerce.number().min(1).max(100) })
 type FormValues = z.infer<typeof schema>
 
 export default function App() {
-  const { items, addFiles, remove, clear } = useImageQueue(); const inputRef = useRef<HTMLInputElement>(null)
+  const { items, addFiles, remove, clear:clearQueue } = useImageQueue(); const inputRef = useRef<HTMLInputElement>(null); const processingRef = useRef<AbortController | null>(null)
   const [operation, setOperation] = useState<Operation>('convert'); const [format, setFormat] = useState<OutputFormat>('webp'); const [isDragging, setDragging] = useState(false); const [isProcessing, setProcessing] = useState(false); const [results, setResults] = useState<ProcessedItem[]>([]); const [notice, setNotice] = useState('')
   const [keepAspect, setKeepAspect] = useState(true); const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const { register, watch, setValue } = useForm<FormValues>({ defaultValues:{ quality:82, percentage:100 } }); const quality = watch('quality') || 82
   const savings = useMemo(() => results.reduce((sum, item) => sum + item.originalSize - item.outputSize, 0), [results])
-  const run = async () => { if (!items.length) { setNotice('Add at least one image to get started.'); return }; setProcessing(true); setResults([]); const next:ProcessedItem[] = []; for (const item of items) { try { next.push(await processImage(item, { operation, format, keepAspect, quality, width:watch('width'), height:watch('height'), percentage:watch('percentage') })) } catch { next.push({ id:newId(), sourceName:item.file.name, name:item.file.name, blob:item.file, preview:item.preview, originalSize:item.file.size, outputSize:item.file.size, status:'error' }) } setResults([...next]) }; setProcessing(false); setNotice(`${next.filter(item=>item.status==='done').length} ${next.length === 1 ? 'image is' : 'images are'} ready.`) }
+  const run = async () => {
+    if (!items.length) { setNotice('Add at least one image to get started.'); return }
+    processingRef.current?.abort()
+    const controller = new AbortController()
+    processingRef.current = controller
+    setProcessing(true)
+    let completed = 0
+    let failed = 0
+    let previewFallbacks = 0
+    const pendingItems = [...items]
+    for (const [index, item] of pendingItems.entries()) {
+      if (controller.signal.aborted) break
+      setNotice(`Processing ${index + 1} of ${pendingItems.length}: ${item.file.name}`)
+      try {
+        const processed = await processImage(item, { operation, format:operation === 'convert' ? format : 'original', keepAspect, quality, width:watch('width'), height:watch('height'), percentage:watch('percentage') }, controller.signal)
+        if (controller.signal.aborted) {
+          URL.revokeObjectURL(processed.preview)
+          break
+        }
+        setResults(current => [...current, processed])
+        remove(item.id)
+        completed += 1
+        if (processed.warning) previewFallbacks += 1
+      } catch {
+        if (controller.signal.aborted) break
+        failed += 1
+      }
+    }
+    if (processingRef.current === controller) {
+      processingRef.current = null
+      setProcessing(false)
+      if (!controller.signal.aborted) {
+        const readyMessage = `${completed} ${completed === 1 ? 'image is' : 'images are'} ready.`
+        const failedMessage = failed ? ` ${failed} could not be processed.` : ''
+        const fallbackMessage = previewFallbacks ? ` ${previewFallbacks} RAW ${previewFallbacks === 1 ? 'file used' : 'files used'} an embedded preview.` : ''
+        setNotice(`${readyMessage}${failedMessage}${fallbackMessage}`)
+      }
+    }
+  }
+  const clear = () => {
+    processingRef.current?.abort()
+    processingRef.current = null
+    setProcessing(false)
+    results.forEach(item => { if (item.preview.startsWith('blob:')) URL.revokeObjectURL(item.preview) })
+    setResults([])
+    clearQueue()
+    setNotice('Queue cleared.')
+  }
   const downloadFile = (item: ProcessedItem) => { const url = URL.createObjectURL(item.blob); const anchor = document.createElement('a'); anchor.href=url; anchor.download=item.name; document.body.appendChild(anchor); anchor.click(); anchor.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000) }
   const downloadFiles = () => { results.forEach((item, index) => setTimeout(() => downloadFile(item), index * 150)); setNotice(`${results.length} standalone ${results.length === 1 ? 'file is' : 'files are'} downloading.`) }
   const downloadZip = async () => { if (!results.length) return; const zip = new JSZip(); results.forEach(item => zip.file(item.name, item.blob)); const blob = await zip.generateAsync({ type:'blob', compression:'DEFLATE' }); const url = URL.createObjectURL(blob); const anchor = document.createElement('a'); anchor.href=url; anchor.download=`imageflow-export-${new Date().toISOString().slice(0,10)}.zip`; anchor.click(); URL.revokeObjectURL(url); setNotice('ZIP downloaded successfully.') }
@@ -32,10 +80,10 @@ export default function App() {
     </aside>
     <main className="main"><header className="topbar"><div><div className="eyebrow">WORKSPACE / IMAGE WORKFLOW</div><h1>Batch image workflow</h1></div><div className="topbar-actions"><Button variant="secondary" onClick={() => inputRef.current?.click()}><Plus size={16}/> Add images</Button></div></header>
       <section className="content"><div className="hero"><div><h2>Move faster with every image.</h2><p>Convert, resize, and compress your image library in one focused workspace.</p></div></div>
-        <div className="dropzone-wrap" onDragEnter={() => setDragging(true)} onDragLeave={() => setDragging(false)} onDragOver={e=>e.preventDefault()} onDrop={onDrop}><motion.div animate={{scale:isDragging?1.01:1, borderColor:isDragging?'#b6a0ff':'var(--border)'}} className="dropzone"><div className="upload-icon"><UploadCloud size={24}/></div><h3>{isDragging ? 'Drop your images here' : 'Drop images to get started'}</h3><p>or <button onClick={() => inputRef.current?.click()}>browse from your computer</button></p><span className="drop-hint">PNG · JPG · WebP · AVIF <i/> Up to 500 images</span><input ref={inputRef} type="file" accept="image/png,image/jpeg,image/webp,image/avif" multiple hidden onChange={e => e.target.files && addFiles(e.target.files)}/></motion.div></div>
+        <div className="dropzone-wrap" onDragEnter={() => setDragging(true)} onDragLeave={() => setDragging(false)} onDragOver={e=>e.preventDefault()} onDrop={onDrop}><motion.div animate={{scale:isDragging?1.01:1, borderColor:isDragging?'#b6a0ff':'var(--border)'}} className="dropzone"><div className="upload-icon"><UploadCloud size={24}/></div><h3>{isDragging ? 'Drop your images here' : 'Drop images to get started'}</h3><p>or <button onClick={() => inputRef.current?.click()}>browse from your computer</button></p><span className="drop-hint">All image formats · Camera RAW <i/> Up to 500 images</span><input ref={inputRef} type="file" accept={IMAGE_FILE_ACCEPT} multiple hidden onChange={e => { if (e.target.files) addFiles(e.target.files); e.target.value = '' }}/></motion.div></div>
         <section className="panel"><div className="panel-head"><div><h3>Workflow</h3><p>Choose what you want to do with your images.</p></div><span className="step"><span>1</span> Configure</span></div><div className="mode-tabs">{(['convert','resize','compress'] as Operation[]).map(value => <button key={value} className={operation===value?'selected':''} onClick={() => setOperation(value)}><span className="mode-icon">{value==="convert"?<ArrowLeftRight size={16}/>:value==="resize"?<Maximize2 size={16}/>:<CircleMinus size={16}/>}</span><span><strong>{value[0].toUpperCase()+value.slice(1)}</strong><small>{value==='convert'?'Change file format':value==='resize'?'Set dimensions':'Reduce file size'}</small></span>{operation===value && <Check size={16}/>}</button>)}</div><div className="controls">{operation==='convert' && <label>Output format<div className="select-wrap"><select value={format} onChange={e=>setFormat(e.target.value as OutputFormat)}><option value="png">PNG · Lossless</option><option value="jpeg">JPG · Universal</option><option value="webp">WebP · Recommended</option><option value="avif">AVIF · Smallest</option></select><ChevronDown size={16}/></div></label>}{operation==='resize' && <><label>Width (px)<input type="number" placeholder="Auto" {...register('width')}/></label><label>Height (px)<input type="number" placeholder="Auto" {...register('height')}/></label><label>Scale<div className="select-wrap"><select {...register('percentage')}><option value="100">100%</option><option value="75">75%</option><option value="50">50%</option><option value="25">25%</option></select><ChevronDown size={16}/></div></label></>}{(operation==='resize'||operation==='compress') && <Toggle checked={keepAspect} onChange={setKeepAspect} label="Keep aspect ratio"/>}{operation==='compress' && <label className="quality">Quality <span>{quality}%</span><input type="range" min="1" max="100" {...register('quality')}/><div className="range-label"><span>Smaller file</span><span>Higher quality</span></div></label>}<Button className="process-btn" onClick={run} disabled={isProcessing}><Play size={16} fill="currentColor"/>{isProcessing?'Processing...':'Process images'}<span className="enter-key"><CornerDownLeft size={13}/></span></Button></div></section>
         <AnimatePresence>{items.length > 0 && <motion.section initial={{opacity:0,y:8}} animate={{opacity:1,y:0}} className="panel queue"><div className="panel-head"><div><h3>Image queue <span className="number-pill">{items.length}</span></h3><p>Ready to be processed.</p></div><button className="text-button" onClick={clear}><Trash2 size={14}/> Clear all</button></div><div className="queue-list">{items.slice(0,5).map(item => <div className="queue-item" key={item.id}><img src={item.preview}/><div><strong>{item.file.name}</strong><small>{formatBytes(item.file.size)}</small></div><button onClick={() => remove(item.id)}><Trash2 size={15}/></button></div>)}{items.length>5 && <span className="more-files">+ {items.length-5} more images</span>}</div></motion.section>}</AnimatePresence>
-        <AnimatePresence>{results.length > 0 && <motion.section initial={{opacity:0,y:8}} animate={{opacity:1,y:0}} className="panel results"><div className="panel-head"><div><h3>Results <span className="number-pill success">{results.length}</span></h3><p>{savings > 0 ? `${formatBytes(savings)} saved across this batch.` : 'Your processed images are ready.'}</p></div><div className="results-actions"><Button variant="secondary" onClick={downloadFiles}><Download size={16}/> Download files</Button><Button onClick={downloadZip}><ArrowDownToLine size={16}/> Download ZIP</Button></div></div><div className="result-grid">{results.slice(0,6).map(item => <div className="result-card" key={item.id}><img src={item.preview}/><div><strong>{item.name}</strong><small>{formatBytes(item.outputSize)} <span>·</span> <em>{item.outputSize < item.originalSize ? `-${Math.round((1-item.outputSize/item.originalSize)*100)}%` : 'ready'}</em></small><button className="text-button download-file" onClick={() => downloadFile(item)}><Download size={13}/> Download file</button></div><Check className="result-check" size={15}/></div>)}</div></motion.section>}</AnimatePresence>
+        <AnimatePresence>{results.length > 0 && <motion.section initial={{opacity:0,y:8}} animate={{opacity:1,y:0}} className="panel results"><div className="panel-head"><div><h3>Results <span className="number-pill success">{results.length}</span></h3><p>{savings > 0 ? `${formatBytes(savings)} saved across this batch.` : 'Your processed images are ready.'}</p></div><div className="results-actions"><Button variant="secondary" onClick={clear}><Trash2 size={16}/> Clear all</Button><Button variant="secondary" onClick={downloadFiles}><Download size={16}/> Download files</Button><Button onClick={downloadZip}><ArrowDownToLine size={16}/> Download ZIP</Button></div></div><div className="result-grid">{results.slice(0,6).map(item => <div className="result-card" key={item.id}><img src={item.preview}/><div><strong>{item.name}</strong><small>{item.width && item.height ? `${item.width} × ${item.height} · ` : ''}{formatBytes(item.outputSize)} <span>·</span> <em title={item.warning}>{item.warning ? 'preview quality' : item.outputSize < item.originalSize ? `-${Math.round((1-item.outputSize/item.originalSize)*100)}%` : 'ready'}</em></small><button className="text-button download-file" onClick={() => downloadFile(item)}><Download size={13}/> Download file</button></div><Check className="result-check" size={15}/></div>)}</div></motion.section>}</AnimatePresence>
       </section>
     </main><AnimatePresence>{notice && <motion.div initial={{opacity:0,y:20}} animate={{opacity:1,y:0}} exit={{opacity:0,y:20}} className="toast"><Check size={16}/>{notice}<button onClick={()=>setNotice('')}><X size={15}/></button></motion.div>}</AnimatePresence>
   </div>
