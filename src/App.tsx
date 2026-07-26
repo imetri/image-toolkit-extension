@@ -76,7 +76,7 @@ export default function App() {
     setProcessing(true);
     let completed = 0;
     let failed = 0;
-    let previewFallbacks = 0;
+    let firstFailure = "";
     const pendingItems = [...items];
     for (const [index, item] of pendingItems.entries()) {
       if (controller.signal.aborted) break;
@@ -104,10 +104,13 @@ export default function App() {
         setResults((current) => [...current, processed]);
         remove(item.id);
         completed += 1;
-        if (processed.warning) previewFallbacks += 1;
-      } catch {
+      } catch (error) {
         if (controller.signal.aborted) break;
         failed += 1;
+        if (!firstFailure) {
+          firstFailure =
+            error instanceof Error ? error.message : "Unknown processing error";
+        }
       }
     }
     if (processingRef.current === controller) {
@@ -116,12 +119,9 @@ export default function App() {
       if (!controller.signal.aborted) {
         const readyMessage = `${completed} ${completed === 1 ? "image is" : "images are"} ready.`;
         const failedMessage = failed
-          ? ` ${failed} could not be processed.`
+          ? ` ${failed} could not be processed: ${firstFailure}`
           : "";
-        const fallbackMessage = previewFallbacks
-          ? ` ${previewFallbacks} RAW ${previewFallbacks === 1 ? "file used" : "files used"} an embedded preview.`
-          : "";
-        setNotice(`${readyMessage}${failedMessage}${fallbackMessage}`);
+        setNotice(`${readyMessage}${failedMessage}`);
       }
     }
   };
@@ -517,6 +517,8 @@ export default function App() {
                           <em title={item.warning}>
                             {item.warning
                               ? "preview quality"
+                              : item.bitDepth
+                                ? `${item.bitDepth}-bit`
                               : item.outputSize < item.originalSize
                                 ? `-${Math.round((1 - item.outputSize / item.originalSize) * 100)}%`
                                 : "ready"}
