@@ -1,14 +1,19 @@
 import LibRawModule from 'libraw-wasm/dist/libraw.js'
+import { applyRawCaptureSharpening } from '../lib/rawEnhance'
+import { encodeRawPng16 } from '../lib/pngEncoder'
+import type { DecodedRawImage } from '../lib/rawDecoder'
+import type { ProcessOptions } from '../types'
 
 type InitMessage = {
   type: 'init'
   wasmDataUrl: string
 }
 
-type DecodeMessage = {
-  type: 'decode'
+type ProcessMessage = {
+  type: 'process'
   id: string
   buffer: ArrayBuffer
+  options: ProcessOptions
 }
 
 type CancelMessage = {
@@ -45,11 +50,54 @@ function decodeDataUrl(dataUrl: string) {
   return bytes
 }
 
+async function rawToRgba(image: DecodedRawImage, signal: AbortSignal) {
+  const pixelCount = image.width * image.height
+  if (image.colors < 1 || image.data.length < pixelCount * image.colors) {
+    throw new Error('The RAW decoder returned incomplete pixel data.')
+  }
+
+  const rgba = new Uint8ClampedArray(pixelCount * 4)
+  const max = image.bits > 8 ? 65535 : 255
+  for (let y = 0; y < image.height; y += 1) {
+    if ((y & 15) === 0) {
+      if (signal.aborted) throw new DOMException('Image processing was cancelled', 'AbortError')
+      if (y > 0) {
+        await new Promise<void>(resolve => globalThis.setTimeout(resolve, 0))
+      }
+    }
+    const rowStart = y * image.width
+    for (let x = 0; x < image.width; x += 1) {
+      const pixel = rowStart + x
+      const source = pixel * image.colors
+      const target = pixel * 4
+      rgba[target] = Math.round(image.data[source] * 255 / max)
+      rgba[target + 1] = Math.round(
+        image.data[source + Math.min(1, image.colors - 1)] * 255 / max,
+      )
+      rgba[target + 2] = Math.round(
+        image.data[source + Math.min(2, image.colors - 1)] * 255 / max,
+      )
+      rgba[target + 3] = 255
+    }
+  }
+  return rgba
+}
+
+function outputMime(format: ProcessOptions['format']) {
+  if (format === 'original') return 'image/jpeg'
+  return {
+    png:'image/png',
+    jpeg:'image/jpeg',
+    webp:'image/webp',
+    avif:'image/avif',
+  }[format]
+}
+
 let runtime: Promise<LibRawRuntime> | undefined
-const cancelled = new Set<string>()
+const controllers = new Map<string, AbortController>()
 
 self.addEventListener('message', event => {
-  const message = event.data as InitMessage | DecodeMessage | CancelMessage
+  const message = event.data as InitMessage | ProcessMessage | CancelMessage
   if (message.type === 'init') {
     runtime = LibRawModule({
       wasmBinary:decodeDataUrl(message.wasmDataUrl),
@@ -64,16 +112,19 @@ self.addEventListener('message', event => {
     return
   }
   if (message.type === 'cancel') {
-    cancelled.add(message.id)
+    controllers.get(message.id)?.abort()
     return
   }
 
   void (async () => {
     let decoder: LibRawInstance | undefined
+    const controller = new AbortController()
+    controllers.set(message.id, controller)
     try {
       if (!runtime) throw new Error('The RAW decoder is not ready.')
       const module = await runtime
-      if (cancelled.delete(message.id)) return
+      if (controller.signal.aborted) return
+
       decoder = new module.LibRaw()
       decoder.open(new Uint8Array(message.buffer), {
         useCameraWb:true,
@@ -89,32 +140,110 @@ self.addEventListener('message', event => {
         fbddNoiserd:1,
         medPasses:1,
       })
-      if (cancelled.delete(message.id)) return
-      const image = decoder.imageData()
-      if (!image?.data?.length || !image.width || !image.height) {
+      if (controller.signal.aborted) return
+      const source = decoder.imageData()
+      if (!source?.data?.length || !source.width || !source.height) {
         throw new Error('The RAW file did not produce image pixels.')
       }
 
-      const pixels = image.bits > 8
-        ? new Uint16Array(image.data).buffer
-        : new Uint8Array(image.data).buffer
+      const image: DecodedRawImage = {
+        width:source.width,
+        height:source.height,
+        colors:source.colors,
+        bits:source.bits,
+        data:source.bits > 8
+          ? new Uint16Array(source.data)
+          : new Uint8Array(source.data),
+      }
+      decoder.delete()
+      decoder = undefined
+
+      await applyRawCaptureSharpening(image, controller.signal)
+      if (
+        message.options.format === 'png' &&
+        message.options.operation !== 'resize'
+      ) {
+        const blob = await encodeRawPng16(image, controller.signal)
+        self.postMessage({
+          type:'processed',
+          id:message.id,
+          blob,
+          width:image.width,
+          height:image.height,
+          bitDepth:16,
+        })
+        return
+      }
+
+      const rgba = await rawToRgba(image, controller.signal)
+      const sourceCanvas = new OffscreenCanvas(image.width, image.height)
+      const sourceContext = sourceCanvas.getContext('2d', { alpha:false })
+      if (!sourceContext) throw new Error('Unable to prepare the RAW image.')
+      sourceContext.putImageData(
+        new ImageData(rgba, image.width, image.height),
+        0,
+        0,
+      )
+
+      const scale = message.options.operation === 'resize'
+        ? (
+            message.options.percentage
+              ? message.options.percentage / 100
+              : Math.min(
+                  message.options.width
+                    ? message.options.width / image.width
+                    : 1,
+                  message.options.height
+                    ? message.options.height / image.height
+                    : 1,
+                )
+          )
+        : 1
+      const width = Math.max(
+        1,
+        Math.round(
+          message.options.keepAspect
+            ? image.width * scale
+            : (message.options.width || image.width * scale),
+        ),
+      )
+      const height = Math.max(
+        1,
+        Math.round(
+          message.options.keepAspect
+            ? image.height * scale
+            : (message.options.height || image.height * scale),
+        ),
+      )
+      const mime = outputMime(message.options.format)
+      const outputCanvas = new OffscreenCanvas(width, height)
+      const outputContext = outputCanvas.getContext('2d', {
+        alpha:mime !== 'image/jpeg',
+      })
+      if (!outputContext) throw new Error('Unable to render the RAW image.')
+      outputContext.drawImage(sourceCanvas, 0, 0, width, height)
+      const quality = mime === 'image/png'
+        ? undefined
+        : message.options.operation === 'compress'
+          ? message.options.quality / 100
+          : 1
+      const blob = await outputCanvas.convertToBlob({ type:mime, quality })
       self.postMessage({
-        type:'decoded',
+        type:'processed',
         id:message.id,
-        width:image.width,
-        height:image.height,
-        colors:image.colors,
-        bits:image.bits,
-        buffer:pixels,
-      }, { transfer:[pixels] })
+        blob,
+        width,
+        height,
+      })
     } catch (error) {
-      if (cancelled.delete(message.id)) return
+      if (controller.signal.aborted) return
       self.postMessage({
         type:'error',
         id:message.id,
-        error:error instanceof Error ? error.message : 'Unable to decode the RAW file.',
+        error:error instanceof Error ? error.message : 'Unable to process the RAW file.',
       })
     } finally {
+      controllers.delete(message.id)
       decoder?.delete()
     }
   })()

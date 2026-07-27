@@ -1,22 +1,26 @@
 import librawWasmDataUrl from 'libraw-wasm/dist/libraw.wasm?raw-inline'
+import type { ProcessOptions } from './types'
 
 const CHANNEL = 'imageflow-raw-decoder'
 
 type DecoderMessage = {
   channel: typeof CHANNEL
-  type: 'decode' | 'cancel'
+  type: 'process' | 'cancel'
   id: string
   buffer?: ArrayBuffer
+  options?: ProcessOptions
 }
 
 type WorkerResponse = {
-  type: 'ready' | 'decoded' | 'error'
+  type: 'ready' | 'processed' | 'error'
   id?: string
   width?: number
   height?: number
   colors?: number
   bits?: number
+  bitDepth?: number
   buffer?: ArrayBuffer
+  blob?: Blob
   error?: string
 }
 
@@ -58,7 +62,7 @@ worker.onerror = event => {
 window.addEventListener('message', event => {
   if (event.source !== window.parent || event.data?.channel !== CHANNEL) return
   const message = event.data as DecoderMessage
-  if (message.type === 'decode' && message.buffer) {
+  if (message.type === 'process' && message.buffer && message.options) {
     pending.add(message.id)
     worker.postMessage(message, [message.buffer])
   } else {

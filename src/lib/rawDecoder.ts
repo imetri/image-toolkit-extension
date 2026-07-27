@@ -1,3 +1,5 @@
+import type { ProcessOptions } from '../types'
+
 const CHANNEL = 'imageflow-raw-decoder'
 
 export type DecodedRawImage = {
@@ -10,22 +12,28 @@ export type DecodedRawImage = {
 
 type SandboxResponse = {
   channel: typeof CHANNEL
-  type: 'ready' | 'decoded' | 'error'
+  type: 'ready' | 'processed' | 'error'
   id?: string
   width?: number
   height?: number
   colors?: number
   bits?: number
-  buffer?: ArrayBuffer
+  bitDepth?: number
+  blob?: Blob
   error?: string
 }
 
 let sandboxFrame: HTMLIFrameElement | undefined
 let sandboxReady: Promise<HTMLIFrameElement> | undefined
+let idleTimer: number | undefined
 
 const abortError = () => new DOMException('Image processing was cancelled', 'AbortError')
 
 function ensureSandbox() {
+  if (idleTimer) {
+    window.clearTimeout(idleTimer)
+    idleTimer = undefined
+  }
   if (sandboxReady) return sandboxReady
 
   sandboxReady = new Promise<HTMLIFrameElement>((resolve, reject) => {
@@ -57,7 +65,18 @@ function ensureSandbox() {
   return sandboxReady
 }
 
-export async function decodeRawImage(file: File, signal?: AbortSignal): Promise<DecodedRawImage> {
+export type ProcessedRawImage = {
+  blob: Blob
+  width: number
+  height: number
+  bitDepth?: number
+}
+
+export async function processRawImage(
+  file: File,
+  options: ProcessOptions,
+  signal?: AbortSignal,
+): Promise<ProcessedRawImage> {
   if (signal?.aborted) throw abortError()
   const frame = await ensureSandbox()
   if (signal?.aborted) throw abortError()
@@ -65,12 +84,12 @@ export async function decodeRawImage(file: File, signal?: AbortSignal): Promise<
   if (signal?.aborted) throw abortError()
   const id = crypto.randomUUID()
 
-  return new Promise<DecodedRawImage>((resolve, reject) => {
+  return new Promise<ProcessedRawImage>((resolve, reject) => {
     const timeout = window.setTimeout(() => {
       frame.contentWindow?.postMessage({ channel:CHANNEL, type:'cancel', id }, '*')
       cleanup()
       resetRawDecoder()
-      reject(new Error(`${file.name} took too long to decode at full resolution.`))
+      reject(new Error(`${file.name} took too long to process at full resolution.`))
     }, 90_000)
     const cleanup = () => {
       window.clearTimeout(timeout)
@@ -91,35 +110,40 @@ export async function decodeRawImage(file: File, signal?: AbortSignal): Promise<
         return
       }
       if (
-        message.type !== 'decoded' ||
-        !message.buffer ||
+        message.type !== 'processed' ||
+        !message.blob ||
         !message.width ||
-        !message.height ||
-        !message.colors ||
-        !message.bits
+        !message.height
       ) {
-        reject(new Error('The RAW decoder returned an invalid image.'))
+        reject(new Error('The RAW processor returned an invalid image.'))
         return
       }
-      const decoded = {
+      const processed = {
+        blob:message.blob,
         width:message.width,
         height:message.height,
-        colors:message.colors,
-        bits:message.bits,
-        data:message.bits > 8 ? new Uint16Array(message.buffer) : new Uint8Array(message.buffer),
+        bitDepth:message.bitDepth,
       }
-      resetRawDecoder()
-      resolve(decoded)
+      idleTimer = window.setTimeout(resetRawDecoder, 5_000)
+      resolve(processed)
     }
 
     if (signal?.aborted) return cancel()
     signal?.addEventListener('abort', cancel, { once:true })
     window.addEventListener('message', onMessage)
-    frame.contentWindow?.postMessage({ channel:CHANNEL, type:'decode', id, buffer:input }, '*', [input])
+    frame.contentWindow?.postMessage({
+      channel:CHANNEL,
+      type:'process',
+      id,
+      buffer:input,
+      options,
+    }, '*', [input])
   })
 }
 
 export function resetRawDecoder() {
+  if (idleTimer) window.clearTimeout(idleTimer)
+  idleTimer = undefined
   sandboxFrame?.remove()
   sandboxFrame = undefined
   sandboxReady = undefined

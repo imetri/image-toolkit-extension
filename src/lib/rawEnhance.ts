@@ -1,7 +1,7 @@
 import type { DecodedRawImage } from './rawDecoder'
 
 const abortError = () => new DOMException('Image processing was cancelled', 'AbortError')
-const yieldToBrowser = () => new Promise<void>(resolve => window.setTimeout(resolve, 0))
+const yieldToBrowser = () => new Promise<void>(resolve => globalThis.setTimeout(resolve, 0))
 
 /**
  * Applies restrained capture sharpening to developed 16-bit RAW pixels.

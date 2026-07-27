@@ -1,9 +1,7 @@
 import type { ImageItem, ProcessOptions, ProcessedItem } from '../types'
 import { extensionFor, newId, outputMime } from './utils'
 import { isRawImage } from './imageFormats'
-import { decodeRawImage } from './rawDecoder'
-import { encodeRawPng16 } from './pngEncoder'
-import { applyRawCaptureSharpening } from './rawEnhance'
+import { processRawImage } from './rawDecoder'
 
 const abortError = () => new DOMException('Image processing was cancelled', 'AbortError')
 
@@ -40,50 +38,6 @@ function encodingQuality(options: ProcessOptions, mime: string) {
   return options.operation === 'compress' ? options.quality / 100 : 1
 }
 
-async function rawPixelsToCanvas(
-  image: Awaited<ReturnType<typeof decodeRawImage>>,
-  signal?: AbortSignal,
-) {
-  if (signal?.aborted) throw abortError()
-  const pixelCount = image.width * image.height
-  if (image.colors < 1 || image.data.length < pixelCount * image.colors) {
-    throw new Error('The RAW decoder returned incomplete pixel data.')
-  }
-
-  const rgba = new Uint8ClampedArray(pixelCount * 4)
-  const max = image.bits > 8 ? 65535 : 255
-  for (let y = 0; y < image.height; y += 1) {
-    if ((y & 15) === 0) {
-      if (signal?.aborted) throw abortError()
-      if (y > 0) await new Promise<void>(resolve => window.setTimeout(resolve, 0))
-    }
-    const rowStart = y * image.width
-    for (let x = 0; x < image.width; x += 1) {
-      const pixel = rowStart + x
-      const source = pixel * image.colors
-      const target = pixel * 4
-      const red = image.data[source]
-      const green = image.data[source + Math.min(1, image.colors - 1)]
-      const blue = image.data[source + Math.min(2, image.colors - 1)]
-      rgba[target] = Math.round(red * 255 / max)
-      rgba[target + 1] = Math.round(green * 255 / max)
-      rgba[target + 2] = Math.round(blue * 255 / max)
-      rgba[target + 3] = 255
-    }
-  }
-
-  const canvas = document.createElement('canvas')
-  canvas.width = image.width
-  canvas.height = image.height
-  canvas.getContext('2d', { alpha:false })!.putImageData(new ImageData(rgba, image.width, image.height), 0, 0)
-  return canvas
-}
-
-async function decodeRawSource(file: File, signal?: AbortSignal) {
-  const fullImage = await applyRawCaptureSharpening(await decodeRawImage(file, signal), signal)
-  return { image:await rawPixelsToCanvas(fullImage, signal) }
-}
-
 export async function processImage(item: ImageItem, options: ProcessOptions, signal?: AbortSignal): Promise<ProcessedItem> {
   if (signal?.aborted) throw abortError()
   const raw = isRawImage(item.file)
@@ -91,21 +45,21 @@ export async function processImage(item: ImageItem, options: ProcessOptions, sig
     ? 'image/jpeg'
     : outputMime(options.format, item.file.type)
   const originalMime = item.file.type === 'image/jpg' ? 'image/jpeg' : item.file.type
-  if (raw && requestedMime === 'image/png' && options.operation !== 'resize') {
-    const decoded = await applyRawCaptureSharpening(await decodeRawImage(item.file, signal), signal)
-    const blob = await encodeRawPng16(decoded, signal)
+  if (raw) {
+    const processed = await processRawImage(item.file, options, signal)
+    const blob = processed.blob
     const base = item.file.name.replace(/\.[^/.]+$/, '')
     return {
       id:newId(),
       sourceName:item.file.name,
-      name:`${base}.png`,
+      name:`${base}.${extensionFor(blob.type || requestedMime)}`,
       blob,
       preview:URL.createObjectURL(blob),
       originalSize:item.file.size,
       outputSize:blob.size,
-      width:decoded.width,
-      height:decoded.height,
-      bitDepth:16,
+      width:processed.width,
+      height:processed.height,
+      bitDepth:processed.bitDepth,
       status:'done',
     }
   }
@@ -128,8 +82,7 @@ export async function processImage(item: ImageItem, options: ProcessOptions, sig
       /* Some browsers cannot encode every requested format off-thread. */
     }
   }
-  const rawSource = raw ? await decodeRawSource(item.file, signal) : undefined
-  const image = rawSource?.image ?? await decode(item.file, signal)
+  const image = await decode(item.file, signal)
   if (signal?.aborted) throw abortError()
   const scale = options.operation === 'resize' ? (options.percentage ? options.percentage / 100 : Math.min(options.width ? options.width / image.width : 1, options.height ? options.height / image.height : 1)) : 1
   const width = Math.max(1, Math.round(options.keepAspect ? image.width * scale : (options.width || image.width * scale)))
