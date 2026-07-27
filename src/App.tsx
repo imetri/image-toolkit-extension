@@ -65,11 +65,6 @@ export default function App() {
   const [height, setHeight] = useState<number | undefined>();
   const [percentage, setPercentage] = useState<number | undefined>(100);
   const [quality, setQuality] = useState(82);
-  const [progress, setProgress] = useState({
-    current: 0,
-    total: 0,
-    fileName: "",
-  });
 
   const totalInputSize = useMemo(
     () => items.reduce((sum, item) => sum + item.file.size, 0),
@@ -104,17 +99,11 @@ export default function App() {
     processingRef.current = controller;
     const pending = [...items];
     setProcessing(true);
-    setProgress({ current: 0, total: pending.length, fileName: "" });
 
     let completed = 0;
     let failed = 0;
     for (const [index, item] of pending.entries()) {
       if (controller.signal.aborted) break;
-      setProgress({
-        current: index + 1,
-        total: pending.length,
-        fileName: item.file.name,
-      });
       try {
         const processed = await processImage(
           item,
@@ -163,7 +152,6 @@ export default function App() {
     });
     setResults([]);
     clearQueue();
-    setProgress({ current: 0, total: 0, fileName: "" });
   };
 
   const downloadFile = (item: ProcessedItem) => {
@@ -449,38 +437,6 @@ export default function App() {
               {isProcessing ? "Processing…" : actionLabel}
             </Button>
           </div>
-          {isProcessing && (
-            <div className="workflow-progress" aria-live="polite">
-              <div>
-                <span>
-                  Processing <strong>{progress.fileName || "images…"}</strong>
-                </span>
-                <span>
-                  {progress.current} of {progress.total}
-                </span>
-              </div>
-              <div
-                className="progress-track"
-                role="progressbar"
-                aria-valuemin={0}
-                aria-valuemax={progress.total}
-                aria-valuenow={progress.current}
-              >
-                <motion.span
-                  animate={{
-                    width: `${
-                      progress.total
-                        ? Math.max(
-                            6,
-                            (progress.current / progress.total) * 100,
-                          )
-                        : 6
-                    }%`,
-                  }}
-                />
-              </div>
-            </div>
-          )}
         </section>
 
         <AnimatePresence>
