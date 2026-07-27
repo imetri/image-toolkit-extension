@@ -17,7 +17,6 @@
   --purple-light: #9b83ff;
   --purple-soft: #f4f1ff;
   --green: #178462;
-  --shadow: 0 22px 58px rgba(38, 31, 55, 0.13);
 }
 
 * {
@@ -89,7 +88,6 @@ p {
   border-radius: 10px;
   color: #fff;
   background: linear-gradient(145deg, #9a80ff, #654ad0);
-  box-shadow: 0 8px 25px rgba(111, 83, 217, 0.35);
 }
 
 .brand strong {
@@ -121,7 +119,6 @@ p {
 .btn-primary {
   color: #fff;
   background: var(--purple);
-  box-shadow: 0 7px 18px rgba(93, 70, 192, 0.23);
 }
 
 .btn-primary:hover:not(:disabled) {
@@ -288,10 +285,6 @@ main {
   background: var(--surface);
 }
 
-.workflow-card {
-  box-shadow: var(--shadow);
-}
-
 .workflow-heading {
   padding: 17px 26px 12px;
 }
@@ -338,7 +331,6 @@ main {
 .operation-tabs button.selected {
   border-color: var(--purple-light);
   background: #faf8ff;
-  box-shadow: inset 0 0 0 1px rgba(120, 95, 227, 0.15);
 }
 
 .operation-icon {
@@ -663,7 +655,6 @@ main {
   border: 1px solid var(--border);
   border-radius: 10px;
   background: #fff;
-  box-shadow: 0 14px 40px rgba(38, 31, 55, 0.18);
   font-size: 11px;
 }
 
