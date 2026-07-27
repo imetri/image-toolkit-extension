@@ -1,6 +1,7 @@
 import type { DecodedRawImage } from './rawDecoder'
 
 const abortError = () => new DOMException('Image processing was cancelled', 'AbortError')
+const yieldToBrowser = () => new Promise<void>(resolve => window.setTimeout(resolve, 0))
 
 /**
  * Applies restrained capture sharpening to developed 16-bit RAW pixels.
@@ -8,7 +9,7 @@ const abortError = () => new DOMException('Image processing was cancelled', 'Abo
  * Processing is row-buffered so a full-resolution image does not need another
  * frame-sized working allocation.
  */
-export function applyRawCaptureSharpening(image: DecodedRawImage, signal?: AbortSignal) {
+export async function applyRawCaptureSharpening(image: DecodedRawImage, signal?: AbortSignal) {
   if (!(image.data instanceof Uint16Array) || image.bits !== 16 || image.colors < 3) return image
   if (image.width < 3 || image.height < 3) return image
 
@@ -20,6 +21,7 @@ export function applyRawCaptureSharpening(image: DecodedRawImage, signal?: Abort
 
   for (let y = 0; y < height; y += 1) {
     if ((y & 31) === 0 && signal?.aborted) throw abortError()
+    if (y > 0 && (y & 15) === 0) await yieldToBrowser()
     const outputRow = y * rowLength
 
     for (let x = 0; x < width; x += 1) {

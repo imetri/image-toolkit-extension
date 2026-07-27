@@ -40,7 +40,7 @@ function encodingQuality(options: ProcessOptions, mime: string) {
   return options.operation === 'compress' ? options.quality / 100 : 1
 }
 
-function rawPixelsToCanvas(
+async function rawPixelsToCanvas(
   image: Awaited<ReturnType<typeof decodeRawImage>>,
   signal?: AbortSignal,
 ) {
@@ -52,17 +52,24 @@ function rawPixelsToCanvas(
 
   const rgba = new Uint8ClampedArray(pixelCount * 4)
   const max = image.bits > 8 ? 65535 : 255
-  for (let pixel = 0; pixel < pixelCount; pixel += 1) {
-    if ((pixel & 0x3ffff) === 0 && signal?.aborted) throw abortError()
-    const source = pixel * image.colors
-    const target = pixel * 4
-    const red = image.data[source]
-    const green = image.data[source + Math.min(1, image.colors - 1)]
-    const blue = image.data[source + Math.min(2, image.colors - 1)]
-    rgba[target] = Math.round(red * 255 / max)
-    rgba[target + 1] = Math.round(green * 255 / max)
-    rgba[target + 2] = Math.round(blue * 255 / max)
-    rgba[target + 3] = 255
+  for (let y = 0; y < image.height; y += 1) {
+    if ((y & 15) === 0) {
+      if (signal?.aborted) throw abortError()
+      if (y > 0) await new Promise<void>(resolve => window.setTimeout(resolve, 0))
+    }
+    const rowStart = y * image.width
+    for (let x = 0; x < image.width; x += 1) {
+      const pixel = rowStart + x
+      const source = pixel * image.colors
+      const target = pixel * 4
+      const red = image.data[source]
+      const green = image.data[source + Math.min(1, image.colors - 1)]
+      const blue = image.data[source + Math.min(2, image.colors - 1)]
+      rgba[target] = Math.round(red * 255 / max)
+      rgba[target + 1] = Math.round(green * 255 / max)
+      rgba[target + 2] = Math.round(blue * 255 / max)
+      rgba[target + 3] = 255
+    }
   }
 
   const canvas = document.createElement('canvas')
@@ -73,8 +80,8 @@ function rawPixelsToCanvas(
 }
 
 async function decodeRawSource(file: File, signal?: AbortSignal) {
-  const fullImage = applyRawCaptureSharpening(await decodeRawImage(file, signal), signal)
-  return { image:rawPixelsToCanvas(fullImage, signal) }
+  const fullImage = await applyRawCaptureSharpening(await decodeRawImage(file, signal), signal)
+  return { image:await rawPixelsToCanvas(fullImage, signal) }
 }
 
 export async function processImage(item: ImageItem, options: ProcessOptions, signal?: AbortSignal): Promise<ProcessedItem> {
@@ -85,7 +92,7 @@ export async function processImage(item: ImageItem, options: ProcessOptions, sig
     : outputMime(options.format, item.file.type)
   const originalMime = item.file.type === 'image/jpg' ? 'image/jpeg' : item.file.type
   if (raw && requestedMime === 'image/png' && options.operation !== 'resize') {
-    const decoded = applyRawCaptureSharpening(await decodeRawImage(item.file, signal), signal)
+    const decoded = await applyRawCaptureSharpening(await decodeRawImage(item.file, signal), signal)
     const blob = await encodeRawPng16(decoded, signal)
     const base = item.file.name.replace(/\.[^/.]+$/, '')
     return {
