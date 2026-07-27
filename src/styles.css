@@ -527,6 +527,12 @@ main {
   color: #a03d4a;
 }
 
+.text-button:disabled,
+.queue-list article > button:disabled {
+  color: #aaa6b2;
+  cursor: not-allowed;
+}
+
 .queue-list,
 .result-list {
   max-height: 300px;

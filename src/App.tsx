@@ -102,6 +102,7 @@ export default function App() {
 
     let completed = 0;
     let failed = 0;
+    const completedIds: string[] = [];
     for (const [index, item] of pending.entries()) {
       if (controller.signal.aborted) break;
       try {
@@ -123,7 +124,7 @@ export default function App() {
           break;
         }
         setResults((current) => [...current, processed]);
-        remove(item.id);
+        completedIds.push(item.id);
         completed += 1;
       } catch {
         if (!controller.signal.aborted) failed += 1;
@@ -131,6 +132,7 @@ export default function App() {
     }
 
     if (processingRef.current === controller) {
+      completedIds.forEach(remove);
       processingRef.current = null;
       setProcessing(false);
       if (!controller.signal.aborted) {
@@ -440,7 +442,7 @@ export default function App() {
         </section>
 
         <AnimatePresence>
-          {items.length > 0 && !isProcessing && (
+          {items.length > 0 && (
             <motion.section
               initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
@@ -451,9 +453,18 @@ export default function App() {
                   <h2>
                     Image queue <span>{items.length}</span>
                   </h2>
-                  <p>Ready to be processed.</p>
+                  <p>
+                    {isProcessing
+                      ? "Processing this queue."
+                      : "Ready to be processed."}
+                  </p>
                 </div>
-                <button type="button" onClick={clear} className="text-button">
+                <button
+                  type="button"
+                  onClick={clear}
+                  className="text-button"
+                  disabled={isProcessing}
+                >
                   <Trash2 size={15} /> Clear all
                 </button>
               </div>
@@ -469,6 +480,7 @@ export default function App() {
                       type="button"
                       onClick={() => remove(item.id)}
                       aria-label={`Remove ${item.file.name}`}
+                      disabled={isProcessing}
                     >
                       <X size={16} />
                     </button>
