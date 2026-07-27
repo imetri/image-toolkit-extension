@@ -276,8 +276,7 @@ main {
 
 .workflow-card,
 .queue-card,
-.results-card,
-.progress-card {
+.results-card {
   margin-top: 16px;
   overflow: hidden;
   border: 1px solid var(--border);
@@ -616,14 +615,30 @@ main {
   gap: 8px;
 }
 
-.progress-card {
-  padding: 18px 22px;
+.workflow-progress {
+  padding: 14px 26px 18px;
+  border-top: 1px solid var(--border);
+  background: #faf9fd;
 }
 
-.progress-card > div:first-child {
+.workflow-progress > div:first-child {
   display: flex;
   justify-content: space-between;
+  gap: 16px;
+  color: var(--muted);
   font-size: 12px;
+}
+
+.workflow-progress > div:first-child span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workflow-progress strong {
+  color: var(--text);
+  font-weight: 600;
 }
 
 .progress-track {
@@ -639,6 +654,16 @@ main {
   display: block;
   border-radius: inherit;
   background: linear-gradient(90deg, var(--purple), var(--purple-light));
+  animation: progress-pulse 1.1s ease-in-out infinite alternate;
+}
+
+@keyframes progress-pulse {
+  from {
+    opacity: 0.72;
+  }
+  to {
+    opacity: 1;
+  }
 }
 
 .toast {
@@ -699,6 +724,11 @@ main {
   .settings {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .workflow-progress {
+    padding-left: 16px;
+    padding-right: 16px;
   }
 
   .settings label,
