@@ -72,7 +72,6 @@ p {
   padding: 0 max(34px, calc((100vw - 1780px) / 2));
   display: flex;
   align-items: center;
-  justify-content: space-between;
   border-bottom: 1px solid rgba(225, 222, 232, 0.95);
 }
 
@@ -151,6 +150,10 @@ main {
 }
 
 .hero {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 32px;
   margin-bottom: 24px;
 }
 
@@ -164,6 +167,12 @@ main {
   margin-top: 13px;
   color: var(--muted);
   font-size: 14px;
+}
+
+.hero-add {
+  min-width: 174px;
+  flex: none;
+  background: rgba(255, 255, 255, 0.66);
 }
 
 .dropzone {
@@ -684,6 +693,10 @@ main {
     padding-top: 28px;
   }
 
+  .hero {
+    align-items: flex-start;
+  }
+
   .operation-tabs,
   .queue-list,
   .result-list {
@@ -731,8 +744,12 @@ main {
     display: none;
   }
 
-  .topbar > .btn {
-    padding: 0 12px;
+  .hero {
+    flex-direction: column;
+  }
+
+  .hero-add {
+    width: 100%;
   }
 
   .workflow-heading,

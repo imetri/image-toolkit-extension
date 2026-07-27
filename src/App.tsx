@@ -203,19 +203,22 @@ export default function App() {
           <strong>imageflow</strong>
           <span>BETA</span>
         </div>
-        <Button
-          variant="secondary"
-          onClick={() => inputRef.current?.click()}
-          disabled={isProcessing}
-        >
-          <Plus size={18} /> Add images
-        </Button>
       </header>
 
       <main>
         <section className="hero">
-          <h1>Move faster with every image.</h1>
-          <p>Convert, resize, and compress your image library in one focused workspace.</p>
+          <div>
+            <h1>Move faster with every image.</h1>
+            <p>Convert, resize, and compress your image library in one focused workspace.</p>
+          </div>
+          <Button
+            className="hero-add"
+            variant="secondary"
+            onClick={() => inputRef.current?.click()}
+            disabled={isProcessing}
+          >
+            <Plus size={18} /> Add images
+          </Button>
         </section>
 
         <input
