@@ -310,16 +310,16 @@ export default function App() {
         </section>
 
         <ol className="stepper" aria-label="Image processing steps">
-          {["Add images", "Choose action", "Adjust settings", "Process"].map(
+          {["Choose action", "Adjust settings", "Add images", "Process"].map(
             (step, index) => {
               const hasBatch = items.length > 0 || isProcessing;
               const complete =
-                (index === 0 && (hasBatch || results.length > 0)) ||
-                (index === 1 && hasBatch) ||
-                (index > 0 && results.length > 0 && !items.length);
+                index < 2 ||
+                (index === 2 && (hasBatch || results.length > 0)) ||
+                (index === 3 && results.length > 0 && !items.length);
               const active =
-                (index === 0 && !items.length && !results.length) ||
-                (index === 2 && items.length > 0 && !isProcessing) ||
+                (index === 1 && !hasBatch && !results.length) ||
+                (index === 2 && !hasBatch && !results.length) ||
                 (index === 3 && (isProcessing || results.length > 0));
               return (
                 <li
@@ -368,9 +368,10 @@ export default function App() {
           </motion.button>
         )}
 
-        {(items.length > 0 || isProcessing) && (
+        {results.length === 0 && (
           <>
-            <section className="queue-summary" aria-label="Selected images">
+            {(items.length > 0 || isProcessing) && (
+              <section className="queue-summary" aria-label="Selected images">
               <div className="summary-copy">
                 <span className="summary-icon">
                   <ImagePlus size={20} />
@@ -417,11 +418,12 @@ export default function App() {
               >
                 <Trash2 size={17} />
               </button>
-            </section>
+              </section>
+            )}
 
             <section className="workspace-card">
               <div className="section-heading">
-                <span className="section-number">2</span>
+                <span className="section-number">1</span>
                 <div>
                   <h2>What would you like to do?</h2>
                   <p>Choose one action for this batch.</p>
@@ -454,7 +456,7 @@ export default function App() {
 
               <div className="settings-area">
                 <div className="section-heading compact">
-                  <span className="section-number">3</span>
+                  <span className="section-number">2</span>
                   <div>
                     <h2>
                       {operation === "convert"
@@ -641,27 +643,41 @@ export default function App() {
 
               <div className="action-bar">
                 <div className="estimate">
-                  <span>Estimated result</span>
-                  <strong>
-                    {formatBytes(estimatedOutputSize)}{" "}
-                    {estimatedOutputSize < totalInputSize && (
-                      <em>
-                        ~
-                        {Math.round(
-                          (1 - estimatedOutputSize / totalInputSize) * 100,
-                        )}
-                        % smaller
-                      </em>
-                    )}
-                  </strong>
+                  <span>
+                    {items.length ? "Estimated result" : "Your setup is ready"}
+                  </span>
+                  {items.length ? (
+                    <strong>
+                      {formatBytes(estimatedOutputSize)}{" "}
+                      {estimatedOutputSize < totalInputSize && (
+                        <em>
+                          ~
+                          {Math.round(
+                            (1 - estimatedOutputSize / totalInputSize) * 100,
+                          )}
+                          % smaller
+                        </em>
+                      )}
+                    </strong>
+                  ) : (
+                    <strong>Add images when you’re ready</strong>
+                  )}
                 </div>
                 <Button
                   className="process-button"
-                  onClick={run}
-                  disabled={!items.length || isProcessing}
+                  onClick={items.length ? run : openFilePicker}
+                  disabled={isProcessing}
                 >
-                  <Play size={17} fill="currentColor" />
-                  {isProcessing ? "Processing…" : processLabel}
+                  {items.length ? (
+                    <Play size={17} fill="currentColor" />
+                  ) : (
+                    <UploadCloud size={17} />
+                  )}
+                  {isProcessing
+                    ? "Processing…"
+                    : items.length
+                      ? processLabel
+                      : `Add images to ${operation}`}
                 </Button>
               </div>
             </section>
