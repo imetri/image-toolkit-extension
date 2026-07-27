@@ -101,13 +101,15 @@ export async function decodeRawImage(file: File, signal?: AbortSignal): Promise<
         reject(new Error('The RAW decoder returned an invalid image.'))
         return
       }
-      resolve({
+      const decoded = {
         width:message.width,
         height:message.height,
         colors:message.colors,
         bits:message.bits,
         data:message.bits > 8 ? new Uint16Array(message.buffer) : new Uint8Array(message.buffer),
-      })
+      }
+      resetRawDecoder()
+      resolve(decoded)
     }
 
     if (signal?.aborted) return cancel()

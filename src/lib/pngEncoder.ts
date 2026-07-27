@@ -23,14 +23,20 @@ function crc32(type: Uint8Array, data: Uint8Array) {
   return (crc ^ 0xffffffff) >>> 0
 }
 
-function chunk(name: string, data = new Uint8Array()) {
-  const type = textEncoder.encode(name)
-  const output = new Uint8Array(12 + data.length)
-  writeUint32(output, 0, data.length)
-  output.set(type, 4)
-  output.set(data, 8)
-  writeUint32(output, 8 + data.length, crc32(type, data))
+function uint32Bytes(value: number) {
+  const output = new Uint8Array(4)
+  writeUint32(output, 0, value)
   return output
+}
+
+function chunkParts(name: string, data = new Uint8Array()) {
+  const type = textEncoder.encode(name)
+  return [
+    uint32Bytes(data.length),
+    type,
+    data,
+    uint32Bytes(crc32(type, data)),
+  ]
 }
 
 function paeth(left: number, above: number, upperLeft: number) {
@@ -40,16 +46,6 @@ function paeth(left: number, above: number, upperLeft: number) {
   const upperLeftDistance = Math.abs(estimate - upperLeft)
   if (leftDistance <= aboveDistance && leftDistance <= upperLeftDistance) return left
   return aboveDistance <= upperLeftDistance ? above : upperLeft
-}
-
-function concatenate(parts: Uint8Array[]) {
-  const output = new Uint8Array(parts.reduce((size, part) => size + part.length, 0))
-  let offset = 0
-  for (const part of parts) {
-    output.set(part, offset)
-    offset += part.length
-  }
-  return output
 }
 
 async function deflateRows(image: DecodedRawImage, signal?: AbortSignal) {
@@ -103,7 +99,7 @@ async function deflateRows(image: DecodedRawImage, signal?: AbortSignal) {
     }
     await writer.close()
     await readCompressed
-    return concatenate(compressedParts)
+    return compressedParts
   } catch (error) {
     await writer.abort(error).catch(() => undefined)
     throw error
@@ -128,9 +124,15 @@ export async function encodeRawPng16(image: DecodedRawImage, signal?: AbortSigna
   header[11] = 0 // adaptive filtering
   header[12] = 0 // no interlace
 
-  const compressed = await deflateRows(image, signal)
+  const compressedParts = await deflateRows(image, signal)
+  const pngParts = [
+    PNG_SIGNATURE,
+    ...chunkParts('IHDR', header),
+    ...compressedParts.flatMap(part => chunkParts('IDAT', part)),
+    ...chunkParts('IEND'),
+  ]
   return new Blob(
-    [PNG_SIGNATURE, chunk('IHDR', header), chunk('IDAT', compressed), chunk('IEND')],
+    pngParts,
     { type:'image/png' },
   )
 }
