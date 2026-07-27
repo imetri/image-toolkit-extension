@@ -8,12 +8,9 @@ import {
   ChevronDown,
   CircleMinus,
   Download,
-  ImagePlus,
   Maximize2,
   Play,
   Plus,
-  RotateCcw,
-  ShieldCheck,
   Trash2,
   UploadCloud,
   X,
@@ -28,51 +25,28 @@ import type { Operation, OutputFormat, ProcessedItem } from "./types";
 
 const operations: Array<{
   value: Operation;
-  title: string;
+  label: string;
   description: string;
   icon: typeof ArrowLeftRight;
 }> = [
   {
     value: "convert",
-    title: "Convert",
+    label: "Convert",
     description: "Change file format",
     icon: ArrowLeftRight,
   },
   {
     value: "resize",
-    title: "Resize",
-    description: "Change dimensions",
+    label: "Resize",
+    description: "Set dimensions",
     icon: Maximize2,
   },
   {
     value: "compress",
-    title: "Compress",
+    label: "Compress",
     description: "Reduce file size",
     icon: CircleMinus,
   },
-];
-
-const formatOptions: Array<{
-  value: OutputFormat;
-  title: string;
-  description: string;
-}> = [
-  { value: "webp", title: "WebP", description: "Best for the web" },
-  { value: "jpeg", title: "JPG", description: "Works everywhere" },
-  { value: "png", title: "PNG", description: "Lossless quality" },
-  { value: "avif", title: "AVIF", description: "Smallest files" },
-];
-
-const resizePresets = [
-  { title: "Instagram", description: "1080 × 1080", width: 1080, height: 1080 },
-  { title: "Full HD", description: "1920 × 1080", width: 1920, height: 1080 },
-  { title: "Half size", description: "50% scale", percentage: 50 },
-];
-
-const compressionPresets = [
-  { title: "Best quality", description: "Light compression", quality: 90 },
-  { title: "Balanced", description: "Recommended", quality: 72 },
-  { title: "Smallest", description: "Maximum savings", quality: 45 },
 ];
 
 export default function App() {
@@ -88,35 +62,14 @@ export default function App() {
   const [keepAspect, setKeepAspect] = useState(true);
   const [width, setWidth] = useState<number | undefined>();
   const [height, setHeight] = useState<number | undefined>();
-  const [percentage, setPercentage] = useState<number | undefined>();
-  const [quality, setQuality] = useState(72);
-  const [activeResizePreset, setActiveResizePreset] = useState("Custom");
-  const [progress, setProgress] = useState({
-    current: 0,
-    total: 0,
-    fileName: "",
-  });
+  const [percentage, setPercentage] = useState<number | undefined>(100);
+  const [quality, setQuality] = useState(82);
+  const [progress, setProgress] = useState({ current: 0, total: 0 });
 
   const totalInputSize = useMemo(
     () => items.reduce((sum, item) => sum + item.file.size, 0),
     [items],
   );
-  const estimatedOutputSize = useMemo(() => {
-    if (!totalInputSize) return 0;
-    if (operation === "compress") {
-      return totalInputSize * Math.max(0.25, quality / 125);
-    }
-    if (operation === "resize") {
-      return totalInputSize * Math.max(
-        0.08,
-        percentage ? Math.pow(percentage / 100, 2) : 0.65,
-      );
-    }
-    const ratio = { webp: 0.7, jpeg: 0.82, png: 1.04, avif: 0.55, original: 1 }[
-      format
-    ];
-    return totalInputSize * ratio;
-  }, [format, operation, percentage, quality, totalInputSize]);
   const savings = useMemo(
     () =>
       results.reduce(
@@ -125,11 +78,6 @@ export default function App() {
       ),
     [results],
   );
-  const progressPercent = progress.total
-    ? Math.round((progress.current / progress.total) * 100)
-    : 0;
-
-  const openFilePicker = () => inputRef.current?.click();
 
   const addSelectedFiles = (files: FileList | null) => {
     if (!files?.length) return;
@@ -140,24 +88,23 @@ export default function App() {
   };
 
   const run = async () => {
-    if (!items.length || isProcessing) return;
-    processingRef.current?.abort();
+    if (!items.length) {
+      inputRef.current?.click();
+      return;
+    }
+    if (isProcessing) return;
+
     const controller = new AbortController();
+    processingRef.current?.abort();
     processingRef.current = controller;
-    const pendingItems = [...items];
+    const pending = [...items];
     setProcessing(true);
-    setProgress({ current: 0, total: pendingItems.length, fileName: "" });
+    setProgress({ current: 0, total: pending.length });
+
     let completed = 0;
     let failed = 0;
-    let firstFailure = "";
-
-    for (const [index, item] of pendingItems.entries()) {
+    for (const [index, item] of pending.entries()) {
       if (controller.signal.aborted) break;
-      setProgress({
-        current: index,
-        total: pendingItems.length,
-        fileName: item.file.name,
-      });
       try {
         const processed = await processImage(
           item,
@@ -179,35 +126,20 @@ export default function App() {
         setResults((current) => [...current, processed]);
         remove(item.id);
         completed += 1;
-        setProgress({
-          current: index + 1,
-          total: pendingItems.length,
-          fileName: item.file.name,
-        });
-      } catch (error) {
-        if (controller.signal.aborted) break;
-        failed += 1;
-        if (!firstFailure) {
-          firstFailure =
-            error instanceof Error ? error.message : "Unknown processing error";
-        }
-        setProgress({
-          current: index + 1,
-          total: pendingItems.length,
-          fileName: item.file.name,
-        });
+      } catch {
+        if (!controller.signal.aborted) failed += 1;
       }
+      setProgress({ current: index + 1, total: pending.length });
     }
 
     if (processingRef.current === controller) {
       processingRef.current = null;
       setProcessing(false);
       if (!controller.signal.aborted) {
-        const success = `${completed} ${completed === 1 ? "image" : "images"} ready`;
         setNotice(
           failed
-            ? `${success}. ${failed} failed: ${firstFailure}`
-            : `${success} to download.`,
+            ? `${completed} ready, ${failed} could not be processed.`
+            : `${completed} ${completed === 1 ? "image is" : "images are"} ready.`,
         );
       }
     }
@@ -222,8 +154,7 @@ export default function App() {
     });
     setResults([]);
     clearQueue();
-    setProgress({ current: 0, total: 0, fileName: "" });
-    setNotice("Workspace cleared.");
+    setProgress({ current: 0, total: 0 });
   };
 
   const downloadFile = (item: ProcessedItem) => {
@@ -231,21 +162,11 @@ export default function App() {
     const anchor = document.createElement("a");
     anchor.href = url;
     anchor.download = item.name;
-    document.body.appendChild(anchor);
     anchor.click();
-    anchor.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
-  const downloadFiles = () => {
-    results.forEach((item, index) =>
-      setTimeout(() => downloadFile(item), index * 150),
-    );
-    setNotice(`${results.length} files are downloading.`);
-  };
-
   const downloadZip = async () => {
-    if (!results.length) return;
     const zip = new JSZip();
     results.forEach((item) => zip.file(item.name, item.blob));
     const blob = await zip.generateAsync({
@@ -258,7 +179,6 @@ export default function App() {
     anchor.download = `imageflow-export-${new Date().toISOString().slice(0, 10)}.zip`;
     anchor.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-    setNotice("ZIP downloaded successfully.");
   };
 
   const onDrop = (event: React.DragEvent) => {
@@ -267,72 +187,36 @@ export default function App() {
     addSelectedFiles(event.dataTransfer.files);
   };
 
-  const chooseResizePreset = (preset: (typeof resizePresets)[number]) => {
-    setActiveResizePreset(preset.title);
-    if (preset.percentage) {
-      setWidth(undefined);
-      setHeight(undefined);
-      setPercentage(preset.percentage);
-    } else {
-      setWidth(preset.width);
-      setHeight(preset.height);
-      setPercentage(undefined);
-    }
-  };
-
-  const processLabel = `${operation[0].toUpperCase()}${operation.slice(1)} ${items.length} ${
-    items.length === 1 ? "image" : "images"
-  }`;
+  const actionLabel = items.length
+    ? `${operation[0].toUpperCase()}${operation.slice(1)} ${items.length} ${
+        items.length === 1 ? "image" : "images"
+      }`
+    : "Process images";
 
   return (
     <div className="app">
       <header className="topbar">
         <div className="brand">
-          <div className="brand-mark">
-            <Zap size={18} fill="currentColor" />
-          </div>
-          <span className="brand-name">imageflow</span>
-          <span className="version">BETA</span>
+          <span className="brand-mark">
+            <Zap size={19} fill="currentColor" />
+          </span>
+          <strong>imageflow</strong>
+          <span>BETA</span>
         </div>
-        <div className="privacy-note">
-          <ShieldCheck size={16} />
-          <span>Private by design · Files stay on your device</span>
-        </div>
+        <Button
+          variant="secondary"
+          onClick={() => inputRef.current?.click()}
+          disabled={isProcessing}
+        >
+          <Plus size={18} /> Add images
+        </Button>
       </header>
 
-      <main className="main">
-        <section className="intro">
-          <div>
-            <span className="eyebrow">LOCAL IMAGE WORKSPACE</span>
-            <h1>Move faster with every image.</h1>
-            <p>Convert, resize, and compress images in one focused workflow.</p>
-          </div>
+      <main>
+        <section className="hero">
+          <h1>Move faster with every image.</h1>
+          <p>Convert, resize, and compress your image library in one focused workspace.</p>
         </section>
-
-        <ol className="stepper" aria-label="Image processing steps">
-          {["Choose action", "Adjust settings", "Add images", "Process"].map(
-            (step, index) => {
-              const hasBatch = items.length > 0 || isProcessing;
-              const complete =
-                index < 2 ||
-                (index === 2 && (hasBatch || results.length > 0)) ||
-                (index === 3 && results.length > 0 && !items.length);
-              const active =
-                (index === 1 && !hasBatch && !results.length) ||
-                (index === 2 && !hasBatch && !results.length) ||
-                (index === 3 && (isProcessing || results.length > 0));
-              return (
-                <li
-                  key={step}
-                  className={`${complete ? "complete" : ""} ${active ? "active" : ""}`}
-                >
-                  <span>{complete ? <Check size={14} /> : index + 1}</span>
-                  <strong>{step}</strong>
-                </li>
-              );
-            },
-          )}
-        </ol>
 
         <input
           ref={inputRef}
@@ -346,407 +230,298 @@ export default function App() {
           }}
         />
 
-        {!items.length && !results.length && (
-          <motion.button
-            type="button"
-            className={`dropzone ${isDragging ? "dragging" : ""}`}
-            onClick={openFilePicker}
-            onDragEnter={() => setDragging(true)}
-            onDragLeave={() => setDragging(false)}
-            onDragOver={(event) => event.preventDefault()}
-            onDrop={onDrop}
-            whileHover={{ y: -2 }}
-          >
-            <span className="upload-icon">
-              <UploadCloud size={28} />
-            </span>
-            <strong>{isDragging ? "Drop them here" : "Drop images here"}</strong>
-            <span>
-              or <em>choose images</em> from your computer
-            </span>
-            <small>JPG, PNG, WebP, AVIF and Camera RAW · Up to 500 images</small>
-          </motion.button>
-        )}
-
-        {results.length === 0 && (
-          <>
-            {(items.length > 0 || isProcessing) && (
-              <section className="queue-summary" aria-label="Selected images">
-              <div className="summary-copy">
-                <span className="summary-icon">
-                  <ImagePlus size={20} />
-                </span>
+        <motion.button
+          type="button"
+          className={`dropzone ${isDragging ? "dragging" : ""} ${
+            items.length ? "has-files" : ""
+          }`}
+          onClick={() => inputRef.current?.click()}
+          onDragEnter={() => setDragging(true)}
+          onDragLeave={() => setDragging(false)}
+          onDragOver={(event) => event.preventDefault()}
+          onDrop={onDrop}
+          whileHover={{ y: -1 }}
+          disabled={isProcessing}
+        >
+          {items.length ? (
+            <>
+              <div className="file-summary">
+                <div className="thumbs" aria-hidden="true">
+                  {items.slice(0, 4).map((item) => (
+                    <img key={item.id} src={item.preview} alt="" />
+                  ))}
+                </div>
                 <div>
                   <strong>
-                    {items.length} {items.length === 1 ? "image" : "images"}{" "}
-                    selected
+                    {items.length} {items.length === 1 ? "image" : "images"} ready
                   </strong>
-                  <small>{formatBytes(totalInputSize)} total</small>
+                  <span>{formatBytes(totalInputSize)} total · Click to add more</span>
                 </div>
               </div>
-              <div className="thumbnail-strip">
-                {items.slice(0, 6).map((item) => (
-                  <div className="thumbnail" key={item.id}>
-                    <img src={item.preview} alt="" />
-                    <button
-                      type="button"
-                      aria-label={`Remove ${item.file.name}`}
-                      onClick={() => remove(item.id)}
+            </>
+          ) : (
+            <>
+              <span className="upload-icon">
+                <UploadCloud size={27} />
+              </span>
+              <strong>{isDragging ? "Drop images here" : "Drop images to get started"}</strong>
+              <span>
+                or <em>browse from your computer</em>
+              </span>
+              <small>All image formats · Camera RAW</small>
+            </>
+          )}
+        </motion.button>
+
+        <section className="workflow-card">
+          <div className="workflow-heading">
+            <h2>Workflow</h2>
+            <p>Choose what you want to do with your images.</p>
+          </div>
+
+          <div className="operation-tabs">
+            {operations.map(({ value, label, description, icon: Icon }) => (
+              <button
+                key={value}
+                type="button"
+                className={operation === value ? "selected" : ""}
+                onClick={() => setOperation(value)}
+                aria-pressed={operation === value}
+                disabled={isProcessing}
+              >
+                <span className="operation-icon">
+                  <Icon size={18} />
+                </span>
+                <span>
+                  <strong>{label}</strong>
+                  <small>{description}</small>
+                </span>
+                {operation === value && <Check className="selected-check" size={16} />}
+              </button>
+            ))}
+          </div>
+
+          <div className="settings-row">
+            <div className="settings">
+              {(operation === "convert" || operation === "compress") && (
+                <label>
+                  Output format
+                  <span className="select-wrap">
+                    <select
+                      value={format}
+                      onChange={(event) =>
+                        setFormat(event.target.value as OutputFormat)
+                      }
                       disabled={isProcessing}
                     >
-                      <X size={12} />
-                    </button>
-                  </div>
-                ))}
-                {items.length > 6 && (
-                  <span className="more-count">+{items.length - 6}</span>
-                )}
-              </div>
-              <Button
-                variant="secondary"
-                onClick={openFilePicker}
-                disabled={isProcessing}
-              >
-                <Plus size={16} /> Add more
-              </Button>
-              <button
-                type="button"
-                className="icon-button"
-                onClick={clear}
-                aria-label="Clear all images"
-                disabled={isProcessing}
-              >
-                <Trash2 size={17} />
-              </button>
-              </section>
-            )}
+                      <option value="webp">WebP · Recommended</option>
+                      <option value="jpeg">JPG · Universal</option>
+                      <option value="png">PNG · Lossless</option>
+                      <option value="avif">AVIF · Smallest</option>
+                    </select>
+                    <ChevronDown size={16} />
+                  </span>
+                </label>
+              )}
 
-            <section className="workspace-card">
-              <div className="section-heading">
-                <span className="section-number">1</span>
-                <div>
-                  <h2>What would you like to do?</h2>
-                  <p>Choose one action for this batch.</p>
-                </div>
-              </div>
-
-              <div className="operation-grid">
-                {operations.map(({ value, title, description, icon: Icon }) => (
-                  <button
-                    type="button"
-                    key={value}
-                    className={operation === value ? "selected" : ""}
-                    onClick={() => setOperation(value)}
-                    aria-pressed={operation === value}
-                    disabled={isProcessing}
-                  >
-                    <span className="mode-icon">
-                      <Icon size={19} />
-                    </span>
-                    <span>
-                      <strong>{title}</strong>
-                      <small>{description}</small>
-                    </span>
-                    <span className="selection-indicator">
-                      {operation === value ? <Check size={14} /> : null}
-                    </span>
-                  </button>
-                ))}
-              </div>
-
-              <div className="settings-area">
-                <div className="section-heading compact">
-                  <span className="section-number">2</span>
-                  <div>
-                    <h2>
-                      {operation === "convert"
-                        ? "Choose an output format"
-                        : operation === "resize"
-                          ? "Choose a size"
-                          : "Choose a compression level"}
-                    </h2>
-                    <p>
-                      {operation === "convert"
-                        ? "WebP gives most images a great balance of quality and size."
-                        : operation === "resize"
-                          ? "Use a familiar preset or enter custom dimensions."
-                          : "Balanced works well for most images."}
-                    </p>
-                  </div>
-                </div>
-
-                {operation === "convert" && (
-                  <div className="preset-grid format-presets">
-                    {formatOptions.map((option) => (
-                      <button
-                        type="button"
-                        key={option.value}
-                        className={format === option.value ? "selected" : ""}
-                        onClick={() => setFormat(option.value)}
-                        aria-pressed={format === option.value}
-                        disabled={isProcessing}
-                      >
-                        <strong>{option.title}</strong>
-                        <small>{option.description}</small>
-                        {option.value === "webp" && <em>Recommended</em>}
-                        <span className="radio-dot" />
-                      </button>
-                    ))}
-                  </div>
-                )}
-
-                {operation === "resize" && (
-                  <>
-                    <div className="preset-grid">
-                      {resizePresets.map((preset) => (
-                        <button
-                          type="button"
-                          key={preset.title}
-                          className={
-                            activeResizePreset === preset.title ? "selected" : ""
-                          }
-                          onClick={() => chooseResizePreset(preset)}
-                          aria-pressed={activeResizePreset === preset.title}
-                          disabled={isProcessing}
-                        >
-                          <strong>{preset.title}</strong>
-                          <small>{preset.description}</small>
-                          <span className="radio-dot" />
-                        </button>
-                      ))}
-                      <button
-                        type="button"
-                        className={
-                          activeResizePreset === "Custom" ? "selected" : ""
-                        }
-                        onClick={() => {
-                          setActiveResizePreset("Custom");
+              {operation === "resize" && (
+                <>
+                  <label>
+                    Width
+                    <span className="input-wrap">
+                      <input
+                        type="number"
+                        min="1"
+                        placeholder="Auto"
+                        value={width ?? ""}
+                        onChange={(event) => {
+                          setWidth(
+                            event.target.value
+                              ? Number(event.target.value)
+                              : undefined,
+                          );
                           setPercentage(undefined);
                         }}
-                        aria-pressed={activeResizePreset === "Custom"}
+                        disabled={isProcessing}
+                      />
+                      <span>px</span>
+                    </span>
+                  </label>
+                  <label>
+                    Height
+                    <span className="input-wrap">
+                      <input
+                        type="number"
+                        min="1"
+                        placeholder="Auto"
+                        value={height ?? ""}
+                        onChange={(event) => {
+                          setHeight(
+                            event.target.value
+                              ? Number(event.target.value)
+                              : undefined,
+                          );
+                          setPercentage(undefined);
+                        }}
+                        disabled={isProcessing}
+                      />
+                      <span>px</span>
+                    </span>
+                  </label>
+                  <label>
+                    Scale
+                    <span className="select-wrap short">
+                      <select
+                        value={percentage ?? ""}
+                        onChange={(event) => {
+                          const value = event.target.value
+                            ? Number(event.target.value)
+                            : undefined;
+                          setPercentage(value);
+                          if (value) {
+                            setWidth(undefined);
+                            setHeight(undefined);
+                          }
+                        }}
                         disabled={isProcessing}
                       >
-                        <strong>Custom</strong>
-                        <small>Enter dimensions</small>
-                        <span className="radio-dot" />
-                      </button>
-                    </div>
-                    {activeResizePreset === "Custom" && (
-                      <div className="custom-controls">
-                        <label>
-                          Width
-                          <div className="input-with-unit">
-                            <input
-                              type="number"
-                              min="1"
-                              value={width ?? ""}
-                              placeholder="Auto"
-                              onChange={(event) =>
-                                setWidth(
-                                  event.target.value
-                                    ? Number(event.target.value)
-                                    : undefined,
-                                )
-                              }
-                              disabled={isProcessing}
-                            />
-                            <span>px</span>
-                          </div>
-                        </label>
-                        <label>
-                          Height
-                          <div className="input-with-unit">
-                            <input
-                              type="number"
-                              min="1"
-                              value={height ?? ""}
-                              placeholder="Auto"
-                              onChange={(event) =>
-                                setHeight(
-                                  event.target.value
-                                    ? Number(event.target.value)
-                                    : undefined,
-                                )
-                              }
-                              disabled={isProcessing}
-                            />
-                            <span>px</span>
-                          </div>
-                        </label>
-                        <Toggle
-                          checked={keepAspect}
-                          onChange={setKeepAspect}
-                          label="Keep aspect ratio"
-                        />
-                      </div>
-                    )}
-                  </>
-                )}
+                        <option value="">Custom</option>
+                        <option value="100">100%</option>
+                        <option value="75">75%</option>
+                        <option value="50">50%</option>
+                        <option value="25">25%</option>
+                      </select>
+                      <ChevronDown size={16} />
+                    </span>
+                  </label>
+                  <Toggle
+                    checked={keepAspect}
+                    onChange={setKeepAspect}
+                    label="Keep aspect ratio"
+                  />
+                </>
+              )}
 
-                {operation === "compress" && (
-                  <>
-                    <div className="preset-grid compression-presets">
-                      {compressionPresets.map((preset) => (
-                        <button
-                          type="button"
-                          key={preset.quality}
-                          className={quality === preset.quality ? "selected" : ""}
-                          onClick={() => setQuality(preset.quality)}
-                          aria-pressed={quality === preset.quality}
-                          disabled={isProcessing}
-                        >
-                          <strong>{preset.title}</strong>
-                          <small>{preset.description}</small>
-                          {preset.quality === 72 && <em>Recommended</em>}
-                          <span className="radio-dot" />
-                        </button>
-                      ))}
-                    </div>
-                    <div className="compress-details">
-                      <label>
-                        Output format
-                        <span className="select-wrap">
-                          <select
-                            value={format}
-                            onChange={(event) =>
-                              setFormat(event.target.value as OutputFormat)
-                            }
-                            disabled={isProcessing}
-                          >
-                            <option value="webp">WebP · Recommended</option>
-                            <option value="jpeg">JPG · Universal</option>
-                            <option value="avif">AVIF · Smallest</option>
-                            <option value="png">PNG · Lossless</option>
-                          </select>
-                          <ChevronDown size={16} />
-                        </span>
-                      </label>
-                      <label className="quality-control">
-                        <span>
-                          Fine-tune quality <strong>{quality}%</strong>
-                        </span>
-                        <input
-                          type="range"
-                          min="20"
-                          max="100"
-                          value={quality}
-                          onChange={(event) =>
-                            setQuality(Number(event.target.value))
-                          }
-                          disabled={isProcessing}
-                        />
-                      </label>
-                    </div>
-                  </>
-                )}
-              </div>
-
-              <div className="action-bar">
-                <div className="estimate">
+              {operation === "compress" && format !== "png" && (
+                <label className="quality-control">
                   <span>
-                    {items.length ? "Estimated result" : "Your setup is ready"}
+                    Quality <strong>{quality}%</strong>
                   </span>
-                  {items.length ? (
-                    <strong>
-                      {formatBytes(estimatedOutputSize)}{" "}
-                      {estimatedOutputSize < totalInputSize && (
-                        <em>
-                          ~
-                          {Math.round(
-                            (1 - estimatedOutputSize / totalInputSize) * 100,
-                          )}
-                          % smaller
-                        </em>
-                      )}
-                    </strong>
-                  ) : (
-                    <strong>Add images when you’re ready</strong>
-                  )}
-                </div>
-                <Button
-                  className="process-button"
-                  onClick={items.length ? run : openFilePicker}
-                  disabled={isProcessing}
-                >
-                  {items.length ? (
-                    <Play size={17} fill="currentColor" />
-                  ) : (
-                    <UploadCloud size={17} />
-                  )}
-                  {isProcessing
-                    ? "Processing…"
-                    : items.length
-                      ? processLabel
-                      : `Add images to ${operation}`}
-                </Button>
-              </div>
-            </section>
-          </>
-        )}
+                  <input
+                    type="range"
+                    min="20"
+                    max="100"
+                    value={quality}
+                    onChange={(event) => setQuality(Number(event.target.value))}
+                    disabled={isProcessing}
+                  />
+                </label>
+              )}
+            </div>
+
+            <Button
+              className="process-button"
+              onClick={run}
+              disabled={isProcessing}
+            >
+              <Play size={17} fill="currentColor" />
+              {isProcessing ? "Processing…" : actionLabel}
+            </Button>
+          </div>
+        </section>
 
         <AnimatePresence>
-          {isProcessing && (
+          {items.length > 0 && !isProcessing && (
             <motion.section
               initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
-              className="progress-card"
-              aria-live="polite"
+              className="queue-card"
             >
-              <div>
-                <span>Processing batch</span>
-                <strong>
-                  {progress.current} of {progress.total}
-                </strong>
+              <div className="card-heading">
+                <div>
+                  <h2>
+                    Image queue <span>{items.length}</span>
+                  </h2>
+                  <p>Ready to be processed.</p>
+                </div>
+                <button type="button" onClick={clear} className="text-button">
+                  <Trash2 size={15} /> Clear all
+                </button>
               </div>
-              <div
-                className="progress-track"
-                role="progressbar"
-                aria-valuemin={0}
-                aria-valuemax={100}
-                aria-valuenow={progressPercent}
-              >
-                <motion.span animate={{ width: `${progressPercent}%` }} />
+              <div className="queue-list">
+                {items.map((item) => (
+                  <article key={item.id}>
+                    <img src={item.preview} alt="" />
+                    <div>
+                      <strong>{item.file.name}</strong>
+                      <small>{formatBytes(item.file.size)}</small>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => remove(item.id)}
+                      aria-label={`Remove ${item.file.name}`}
+                    >
+                      <X size={16} />
+                    </button>
+                  </article>
+                ))}
               </div>
-              <small>{progress.fileName || "Preparing images…"}</small>
             </motion.section>
           )}
         </AnimatePresence>
 
+        {isProcessing && (
+          <section className="progress-card" aria-live="polite">
+            <div>
+              <strong>Processing images</strong>
+              <span>
+                {progress.current} of {progress.total}
+              </span>
+            </div>
+            <div className="progress-track">
+              <motion.span
+                animate={{
+                  width: `${
+                    progress.total
+                      ? (progress.current / progress.total) * 100
+                      : 0
+                  }%`,
+                }}
+              />
+            </div>
+          </section>
+        )}
+
         <AnimatePresence>
           {results.length > 0 && !isProcessing && (
             <motion.section
-              initial={{ opacity: 0, y: 10 }}
+              initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
-              className="success-card"
+              className="results-card"
             >
-              <div className="success-hero">
-                <span className="success-icon">
-                  <Check size={22} />
-                </span>
+              <div className="card-heading">
                 <div>
-                  <span className="eyebrow">BATCH COMPLETE</span>
                   <h2>
-                    {results.length}{" "}
-                    {results.length === 1 ? "image is" : "images are"} ready.
+                    Images ready <span className="success">{results.length}</span>
                   </h2>
                   <p>
-                    {savings > 0
-                      ? `You saved ${formatBytes(savings)} across this batch.`
-                      : "Your processed images are ready to download."}
+                    {savings
+                      ? `${formatBytes(savings)} saved across this batch.`
+                      : "Your processed files are ready."}
                   </p>
                 </div>
-                <div className="success-actions">
-                  <Button variant="secondary" onClick={downloadFiles}>
-                    <Download size={16} /> Download files
+                <div className="result-actions">
+                  <Button variant="secondary" onClick={clear}>
+                    Start over
                   </Button>
                   <Button onClick={downloadZip}>
                     <ArrowDownToLine size={17} /> Download all
                   </Button>
                 </div>
               </div>
-              <div className="result-grid">
+              <div className="result-list">
                 {results.map((item) => (
-                  <article className="result-card" key={item.id}>
+                  <article key={item.id}>
                     <img src={item.preview} alt="" />
                     <div>
                       <strong>{item.name}</strong>
@@ -759,17 +534,14 @@ export default function App() {
                     </div>
                     <button
                       type="button"
-                      aria-label={`Download ${item.name}`}
                       onClick={() => downloadFile(item)}
+                      aria-label={`Download ${item.name}`}
                     >
                       <Download size={16} />
                     </button>
                   </article>
                 ))}
               </div>
-              <button type="button" className="start-over" onClick={clear}>
-                <RotateCcw size={15} /> Start a new batch
-              </button>
             </motion.section>
           )}
         </AnimatePresence>
@@ -778,14 +550,14 @@ export default function App() {
       <AnimatePresence>
         {notice && (
           <motion.div
-            initial={{ opacity: 0, y: 20 }}
+            initial={{ opacity: 0, y: 15 }}
             animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 20 }}
+            exit={{ opacity: 0, y: 15 }}
             className="toast"
             role="status"
           >
             <Check size={16} />
-            {notice}
+            <span>{notice}</span>
             <button
               type="button"
               onClick={() => setNotice("")}
