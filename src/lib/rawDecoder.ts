@@ -25,36 +25,50 @@ type SandboxResponse = {
   stage?: string
 }
 
-let sandboxFrame: HTMLIFrameElement | undefined
-let sandboxReady: Promise<HTMLIFrameElement> | undefined
+type SandboxSlot = {
+  frame: HTMLIFrameElement
+  ready: Promise<HTMLIFrameElement>
+  busy: boolean
+}
+
+const sandboxSlots: SandboxSlot[] = []
+const sandboxWaiters: Array<(slot: SandboxSlot) => void> = []
 let idleTimer: number | undefined
 
 const abortError = () => new DOMException('Image processing was cancelled', 'AbortError')
 
-function ensureSandbox() {
-  if (idleTimer) {
-    window.clearTimeout(idleTimer)
-    idleTimer = undefined
-  }
-  if (sandboxReady) return sandboxReady
+export function rawProcessingConcurrency() {
+  const deviceMemory = (
+    navigator as Navigator & { deviceMemory?: number }
+  ).deviceMemory ?? 4
+  return deviceMemory >= 8 && navigator.hardwareConcurrency >= 8 ? 2 : 1
+}
 
-  sandboxReady = new Promise<HTMLIFrameElement>((resolve, reject) => {
-    const frame = document.createElement('iframe')
-    sandboxFrame = frame
-    frame.hidden = true
-    frame.setAttribute('aria-hidden', 'true')
-    frame.src = new URL('raw-sandbox.html', window.location.href).href
+function createSandbox() {
+  const frame = document.createElement('iframe')
+  frame.hidden = true
+  frame.setAttribute('aria-hidden', 'true')
+  frame.src = new URL('raw-sandbox.html', window.location.href).href
 
+  const slot = {
+    frame,
+    busy:true,
+    ready:Promise.resolve(frame),
+  } as SandboxSlot
+
+  slot.ready = new Promise<HTMLIFrameElement>((resolve, reject) => {
     const timeout = window.setTimeout(() => {
       window.removeEventListener('message', onReady)
-      sandboxReady = undefined
-      sandboxFrame = undefined
       frame.remove()
       reject(new Error('The full-resolution RAW decoder did not start.'))
     }, 20_000)
 
     const onReady = (event: MessageEvent<SandboxResponse>) => {
-      if (event.source !== frame.contentWindow || event.data?.channel !== CHANNEL || event.data.type !== 'ready') return
+      if (
+        event.source !== frame.contentWindow ||
+        event.data?.channel !== CHANNEL ||
+        event.data.type !== 'ready'
+      ) return
       window.clearTimeout(timeout)
       window.removeEventListener('message', onReady)
       resolve(frame)
@@ -63,8 +77,45 @@ function ensureSandbox() {
     window.addEventListener('message', onReady)
     document.body.appendChild(frame)
   })
+  sandboxSlots.push(slot)
+  return slot
+}
 
-  return sandboxReady
+function acquireSandbox() {
+  if (idleTimer) {
+    window.clearTimeout(idleTimer)
+    idleTimer = undefined
+  }
+  const available = sandboxSlots.find(slot => !slot.busy)
+  if (available) {
+    available.busy = true
+    return Promise.resolve(available)
+  }
+  if (sandboxSlots.length < rawProcessingConcurrency()) {
+    return Promise.resolve(createSandbox())
+  }
+  return new Promise<SandboxSlot>(resolve => sandboxWaiters.push(resolve))
+}
+
+function releaseSandbox(slot: SandboxSlot) {
+  const waiter = sandboxWaiters.shift()
+  if (waiter) {
+    slot.busy = true
+    waiter(slot)
+    return
+  }
+  slot.busy = false
+  if (sandboxSlots.every(candidate => !candidate.busy)) {
+    idleTimer = window.setTimeout(resetRawDecoder, 5_000)
+  }
+}
+
+function discardSandbox(slot: SandboxSlot) {
+  const index = sandboxSlots.indexOf(slot)
+  if (index >= 0) sandboxSlots.splice(index, 1)
+  slot.frame.remove()
+  const waiter = sandboxWaiters.shift()
+  if (waiter) waiter(createSandbox())
 }
 
 export type ProcessedRawImage = {
@@ -81,23 +132,41 @@ export async function processRawImage(
   onProgress?: (update: ProcessProgress) => void,
 ): Promise<ProcessedRawImage> {
   if (signal?.aborted) throw abortError()
-  const frame = await ensureSandbox()
-  if (signal?.aborted) throw abortError()
+  const slot = await acquireSandbox()
+  let frame: HTMLIFrameElement
+  try {
+    frame = await slot.ready
+  } catch (error) {
+    discardSandbox(slot)
+    throw error
+  }
+  if (signal?.aborted) {
+    releaseSandbox(slot)
+    throw abortError()
+  }
   const input = await file.arrayBuffer()
-  if (signal?.aborted) throw abortError()
+  if (signal?.aborted) {
+    releaseSandbox(slot)
+    throw abortError()
+  }
   const id = crypto.randomUUID()
 
   return new Promise<ProcessedRawImage>((resolve, reject) => {
+    let released = false
     const timeout = window.setTimeout(() => {
       frame.contentWindow?.postMessage({ channel:CHANNEL, type:'cancel', id }, '*')
-      cleanup()
-      resetRawDecoder()
+      cleanup(false)
+      discardSandbox(slot)
       reject(new Error(`${file.name} took too long to process at full resolution.`))
     }, 90_000)
-    const cleanup = () => {
+    const cleanup = (shouldRelease = true) => {
       window.clearTimeout(timeout)
       signal?.removeEventListener('abort', cancel)
       window.removeEventListener('message', onMessage)
+      if (!released) {
+        released = true
+        if (shouldRelease) releaseSandbox(slot)
+      }
     }
     const cancel = () => {
       frame.contentWindow?.postMessage({ channel:CHANNEL, type:'cancel', id }, '*')
@@ -134,7 +203,6 @@ export async function processRawImage(
         height:message.height,
         bitDepth:message.bitDepth,
       }
-      idleTimer = window.setTimeout(resetRawDecoder, 5_000)
       resolve(processed)
     }
 
@@ -154,7 +222,7 @@ export async function processRawImage(
 export function resetRawDecoder() {
   if (idleTimer) window.clearTimeout(idleTimer)
   idleTimer = undefined
-  sandboxFrame?.remove()
-  sandboxFrame = undefined
-  sandboxReady = undefined
+  if (sandboxSlots.some(slot => slot.busy)) return
+  sandboxSlots.forEach(slot => slot.frame.remove())
+  sandboxSlots.length = 0
 }

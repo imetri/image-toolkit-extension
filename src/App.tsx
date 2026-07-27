@@ -20,7 +20,8 @@ import {
 import { Button, Toggle } from "./components/ui";
 import { useImageQueue } from "./hooks/useImageQueue";
 import { processImage } from "./lib/imageProcessor";
-import { IMAGE_FILE_ACCEPT } from "./lib/imageFormats";
+import { IMAGE_FILE_ACCEPT, isRawImage } from "./lib/imageFormats";
+import { rawProcessingConcurrency } from "./lib/rawDecoder";
 import { formatBytes } from "./lib/utils";
 import type { Operation, OutputFormat, ProcessedItem } from "./types";
 
@@ -120,64 +121,83 @@ export default function App() {
 
     let completed = 0;
     let failed = 0;
+    let nextIndex = 0;
     const completedIds: string[] = [];
-    for (const [index, item] of pending.entries()) {
-      if (controller.signal.aborted) break;
-      try {
-        const processed = await processImage(
-          item,
-          {
-            operation,
-            format: operation === "resize" ? "original" : format,
-            keepAspect,
-            quality,
-            width,
-            height,
-            percentage,
-          },
-          controller.signal,
-          ({ progress, stage }) => {
-            const overallProgress = (index + progress) / pending.length;
-            const elapsedSeconds = (performance.now() - startedAt) / 1000;
-            const secondsRemaining = overallProgress > 0.03
-              ? Math.max(0, Math.round(
-                  elapsedSeconds / overallProgress - elapsedSeconds,
-                ))
-              : undefined;
-            setBatchProgress({
-              current:index + 1,
-              total:pending.length,
-              filename:item.file.name,
-              percent:Math.min(99, Math.round(overallProgress * 100)),
-              stage,
-              secondsRemaining,
-            });
-          },
-        );
-        if (controller.signal.aborted) {
-          URL.revokeObjectURL(processed.preview);
-          break;
+    const itemProgress = new Map(pending.map(item => [item.id, 0]));
+    const updateProgress = (
+      item: (typeof pending)[number],
+      progress: number,
+      stage: string,
+    ) => {
+      itemProgress.set(item.id, progress);
+      const overallProgress = [...itemProgress.values()]
+        .reduce((sum, value) => sum + value, 0) / pending.length;
+      const elapsedSeconds = (performance.now() - startedAt) / 1000;
+      const secondsRemaining = overallProgress > 0.03
+        ? Math.max(0, Math.round(
+            elapsedSeconds / overallProgress - elapsedSeconds,
+          ))
+        : undefined;
+      setBatchProgress({
+        current:Math.min(completed + 1, pending.length),
+        total:pending.length,
+        filename:item.file.name,
+        percent:Math.min(99, Math.round(overallProgress * 100)),
+        stage,
+        secondsRemaining,
+      });
+    };
+
+    const processNext = async () => {
+      while (!controller.signal.aborted) {
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= pending.length) return;
+        const item = pending[index];
+        try {
+          const processed = await processImage(
+            item,
+            {
+              operation,
+              format: operation === "resize" ? "original" : format,
+              keepAspect,
+              quality,
+              width,
+              height,
+              percentage,
+            },
+            controller.signal,
+            ({ progress, stage }) => updateProgress(item, progress, stage),
+          );
+          if (controller.signal.aborted) {
+            URL.revokeObjectURL(processed.preview);
+            return;
+          }
+          itemProgress.set(item.id, 1);
+          setResults((current) => [...current, processed]);
+          completedIds.push(item.id);
+          completed += 1;
+          updateProgress(
+            item,
+            1,
+            completed === pending.length ? "Complete" : "Preparing next image",
+          );
+        } catch {
+          if (!controller.signal.aborted) {
+            itemProgress.set(item.id, 1);
+            failed += 1;
+          }
         }
-        setResults((current) => [...current, processed]);
-        completedIds.push(item.id);
-        completed += 1;
-        setBatchProgress({
-          current:Math.min(index + 2, pending.length),
-          total:pending.length,
-          filename:pending[index + 1]?.file.name || item.file.name,
-          percent:Math.round(((index + 1) / pending.length) * 100),
-          stage:index + 1 < pending.length ? "Preparing next image" : "Complete",
-          secondsRemaining:index + 1 < pending.length
-            ? Math.max(0, Math.round(
-                ((performance.now() - startedAt) / 1000) *
-                (pending.length - index - 1) / (index + 1),
-              ))
-            : 0,
-        });
-      } catch {
-        if (!controller.signal.aborted) failed += 1;
       }
-    }
+    };
+
+    const containsRaw = pending.some(item => isRawImage(item.file));
+    const concurrency = containsRaw
+      ? Math.min(rawProcessingConcurrency(), pending.length)
+      : Math.min(3, pending.length);
+    await Promise.all(
+      Array.from({ length:concurrency }, () => processNext()),
+    );
 
     if (processingRef.current === controller) {
       completedIds.forEach(remove);

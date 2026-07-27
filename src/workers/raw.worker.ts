@@ -57,9 +57,10 @@ async function rawToRgba(image: DecodedRawImage, signal: AbortSignal) {
   }
 
   const rgba = new Uint8ClampedArray(pixelCount * 4)
-  const max = image.bits > 8 ? 65535 : 255
+  const greenOffset = image.colors > 1 ? 1 : 0
+  const blueOffset = image.colors > 2 ? 2 : 0
   for (let y = 0; y < image.height; y += 1) {
-    if ((y & 15) === 0) {
+    if ((y & 127) === 0) {
       if (signal.aborted) throw new DOMException('Image processing was cancelled', 'AbortError')
       if (y > 0) {
         await new Promise<void>(resolve => globalThis.setTimeout(resolve, 0))
@@ -70,13 +71,17 @@ async function rawToRgba(image: DecodedRawImage, signal: AbortSignal) {
       const pixel = rowStart + x
       const source = pixel * image.colors
       const target = pixel * 4
-      rgba[target] = Math.round(image.data[source] * 255 / max)
-      rgba[target + 1] = Math.round(
-        image.data[source + Math.min(1, image.colors - 1)] * 255 / max,
-      )
-      rgba[target + 2] = Math.round(
-        image.data[source + Math.min(2, image.colors - 1)] * 255 / max,
-      )
+      if (image.bits > 8) {
+        // 65535 / 255 is exactly 257, so this preserves the same 16-to-8-bit
+        // rounding while avoiding three expensive divisions by 65535.
+        rgba[target] = image.data[source] / 257
+        rgba[target + 1] = image.data[source + greenOffset] / 257
+        rgba[target + 2] = image.data[source + blueOffset] / 257
+      } else {
+        rgba[target] = image.data[source]
+        rgba[target + 1] = image.data[source + greenOffset]
+        rgba[target + 2] = image.data[source + blueOffset]
+      }
       rgba[target + 3] = 255
     }
   }

@@ -25,7 +25,7 @@ export async function applyRawCaptureSharpening(
 
   for (let y = 0; y < height; y += 1) {
     if ((y & 31) === 0 && signal?.aborted) throw abortError()
-    if (y > 0 && (y & 15) === 0) {
+    if (y > 0 && (y & 63) === 0) {
       onProgress?.(y / height)
       await yieldToBrowser()
     }
@@ -59,10 +59,12 @@ export async function applyRawCaptureSharpening(
       }
     }
 
+    const reusableRow = above
     above = center
     center = below
     const nextRow = Math.min(height - 1, y + 2)
-    below = data.slice(nextRow * rowLength, (nextRow + 1) * rowLength)
+    below = reusableRow
+    below.set(data.subarray(nextRow * rowLength, (nextRow + 1) * rowLength))
   }
 
   onProgress?.(1)
