@@ -24,6 +24,15 @@ import { IMAGE_FILE_ACCEPT } from "./lib/imageFormats";
 import { formatBytes } from "./lib/utils";
 import type { Operation, OutputFormat, ProcessedItem } from "./types";
 
+type BatchProgress = {
+  current: number;
+  total: number;
+  filename: string;
+  percent: number;
+  stage: string;
+  secondsRemaining?: number;
+};
+
 const operations: Array<{
   value: Operation;
   label: string;
@@ -58,6 +67,7 @@ export default function App() {
   const [format, setFormat] = useState<OutputFormat>("webp");
   const [isDragging, setDragging] = useState(false);
   const [isProcessing, setProcessing] = useState(false);
+  const [batchProgress, setBatchProgress] = useState<BatchProgress | null>(null);
   const [results, setResults] = useState<ProcessedItem[]>([]);
   const [notice, setNotice] = useState("");
   const [keepAspect, setKeepAspect] = useState(true);
@@ -99,6 +109,14 @@ export default function App() {
     processingRef.current = controller;
     const pending = [...items];
     setProcessing(true);
+    const startedAt = performance.now();
+    setBatchProgress({
+      current:1,
+      total:pending.length,
+      filename:pending[0].file.name,
+      percent:0,
+      stage:"Preparing image",
+    });
 
     let completed = 0;
     let failed = 0;
@@ -118,6 +136,23 @@ export default function App() {
             percentage,
           },
           controller.signal,
+          ({ progress, stage }) => {
+            const overallProgress = (index + progress) / pending.length;
+            const elapsedSeconds = (performance.now() - startedAt) / 1000;
+            const secondsRemaining = overallProgress > 0.03
+              ? Math.max(0, Math.round(
+                  elapsedSeconds / overallProgress - elapsedSeconds,
+                ))
+              : undefined;
+            setBatchProgress({
+              current:index + 1,
+              total:pending.length,
+              filename:item.file.name,
+              percent:Math.min(99, Math.round(overallProgress * 100)),
+              stage,
+              secondsRemaining,
+            });
+          },
         );
         if (controller.signal.aborted) {
           URL.revokeObjectURL(processed.preview);
@@ -126,6 +161,19 @@ export default function App() {
         setResults((current) => [...current, processed]);
         completedIds.push(item.id);
         completed += 1;
+        setBatchProgress({
+          current:Math.min(index + 2, pending.length),
+          total:pending.length,
+          filename:pending[index + 1]?.file.name || item.file.name,
+          percent:Math.round(((index + 1) / pending.length) * 100),
+          stage:index + 1 < pending.length ? "Preparing next image" : "Complete",
+          secondsRemaining:index + 1 < pending.length
+            ? Math.max(0, Math.round(
+                ((performance.now() - startedAt) / 1000) *
+                (pending.length - index - 1) / (index + 1),
+              ))
+            : 0,
+        });
       } catch {
         if (!controller.signal.aborted) failed += 1;
       }
@@ -135,6 +183,7 @@ export default function App() {
       completedIds.forEach(remove);
       processingRef.current = null;
       setProcessing(false);
+      setBatchProgress(null);
       if (!controller.signal.aborted) {
         setNotice(
           failed
@@ -149,6 +198,7 @@ export default function App() {
     processingRef.current?.abort();
     processingRef.current = null;
     setProcessing(false);
+    setBatchProgress(null);
     results.forEach((item) => {
       if (item.preview.startsWith("blob:")) URL.revokeObjectURL(item.preview);
     });
@@ -487,6 +537,43 @@ export default function App() {
                   </article>
                 ))}
               </div>
+              {isProcessing && batchProgress && (
+                <div className="batch-progress" aria-live="polite">
+                  <div className="progress-copy">
+                    <div>
+                      <strong>{batchProgress.stage}</strong>
+                      <span title={batchProgress.filename}>
+                        {batchProgress.filename}
+                      </span>
+                    </div>
+                    <div>
+                      <strong>{batchProgress.percent}%</strong>
+                      <span>
+                        {batchProgress.current} of {batchProgress.total}
+                        {batchProgress.secondsRemaining !== undefined &&
+                        batchProgress.secondsRemaining > 0
+                          ? ` · about ${batchProgress.secondsRemaining < 60
+                            ? `${batchProgress.secondsRemaining}s`
+                            : `${Math.ceil(batchProgress.secondsRemaining / 60)} min`} left`
+                          : ""}
+                      </span>
+                    </div>
+                  </div>
+                  <div
+                    className="progress-track"
+                    role="progressbar"
+                    aria-label={`Processing ${batchProgress.filename}`}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={batchProgress.percent}
+                  >
+                    <span style={{ width:`${batchProgress.percent}%` }} />
+                  </div>
+                  <small>
+                    Keep this tab open. Large RAW files can take longer at full quality.
+                  </small>
+                </div>
+              )}
             </motion.section>
           )}
         </AnimatePresence>

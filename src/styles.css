@@ -543,6 +543,68 @@ main {
   overflow-y: auto;
 }
 
+.batch-progress {
+  padding: 14px 22px 17px;
+  border-top: 1px solid var(--border);
+  background: #fff;
+}
+
+.progress-copy {
+  margin-bottom: 9px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.progress-copy > div {
+  min-width: 0;
+}
+
+.progress-copy > div:last-child {
+  flex: none;
+  text-align: right;
+}
+
+.progress-copy strong,
+.progress-copy span {
+  display: block;
+}
+
+.progress-copy strong {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.progress-copy span,
+.batch-progress > small {
+  margin-top: 4px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.progress-track {
+  height: 7px;
+  overflow: hidden;
+  border-radius: 10px;
+  background: var(--soft);
+}
+
+.progress-track > span {
+  height: 100%;
+  display: block;
+  border-radius: inherit;
+  background: var(--purple);
+  transition: width 180ms ease;
+}
+
+.batch-progress > small {
+  display: block;
+}
+
 .queue-list article,
 .result-list article {
   min-width: 0;

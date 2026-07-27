@@ -12,7 +12,7 @@ type DecoderMessage = {
 }
 
 type WorkerResponse = {
-  type: 'ready' | 'processed' | 'error'
+  type: 'ready' | 'processed' | 'error' | 'progress'
   id?: string
   width?: number
   height?: number
@@ -22,6 +22,8 @@ type WorkerResponse = {
   buffer?: ArrayBuffer
   blob?: Blob
   error?: string
+  progress?: number
+  stage?: string
 }
 
 const worker = new Worker(
@@ -38,7 +40,7 @@ worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
     return
   }
   if (!message.id) return
-  pending.delete(message.id)
+  if (message.type !== 'progress') pending.delete(message.id)
   const response = { channel:CHANNEL, ...message }
   if (message.buffer) {
     window.parent.postMessage(response, '*', [message.buffer])

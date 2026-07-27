@@ -95,6 +95,9 @@ function outputMime(format: ProcessOptions['format']) {
 
 let runtime: Promise<LibRawRuntime> | undefined
 const controllers = new Map<string, AbortController>()
+const reportProgress = (id: string, progress: number, stage: string) => {
+  self.postMessage({ type:'progress', id, progress, stage })
+}
 
 self.addEventListener('message', event => {
   const message = event.data as InitMessage | ProcessMessage | CancelMessage
@@ -122,10 +125,12 @@ self.addEventListener('message', event => {
     controllers.set(message.id, controller)
     try {
       if (!runtime) throw new Error('The RAW decoder is not ready.')
+      reportProgress(message.id, 0.04, 'Starting RAW decoder')
       const module = await runtime
       if (controller.signal.aborted) return
 
       decoder = new module.LibRaw()
+      reportProgress(message.id, 0.08, 'Developing RAW image')
       decoder.open(new Uint8Array(message.buffer), {
         useCameraWb:true,
         useCameraMatrix:1,
@@ -158,12 +163,30 @@ self.addEventListener('message', event => {
       decoder.delete()
       decoder = undefined
 
-      await applyRawCaptureSharpening(image, controller.signal)
+      reportProgress(message.id, 0.36, 'Restoring image detail')
+      await applyRawCaptureSharpening(
+        image,
+        controller.signal,
+        progress => reportProgress(
+          message.id,
+          0.36 + progress * 0.25,
+          'Restoring image detail',
+        ),
+      )
       if (
         message.options.format === 'png' &&
         message.options.operation !== 'resize'
       ) {
-        const blob = await encodeRawPng16(image, controller.signal)
+        reportProgress(message.id, 0.62, 'Encoding lossless PNG')
+        const blob = await encodeRawPng16(
+          image,
+          controller.signal,
+          progress => reportProgress(
+            message.id,
+            0.62 + progress * 0.36,
+            'Encoding lossless PNG',
+          ),
+        )
         self.postMessage({
           type:'processed',
           id:message.id,
@@ -175,7 +198,9 @@ self.addEventListener('message', event => {
         return
       }
 
+      reportProgress(message.id, 0.62, 'Preparing image pixels')
       const rgba = await rawToRgba(image, controller.signal)
+      reportProgress(message.id, 0.79, 'Encoding output image')
       const sourceCanvas = new OffscreenCanvas(image.width, image.height)
       const sourceContext = sourceCanvas.getContext('2d', { alpha:false })
       if (!sourceContext) throw new Error('Unable to prepare the RAW image.')
@@ -228,6 +253,7 @@ self.addEventListener('message', event => {
           ? message.options.quality / 100
           : 1
       const blob = await outputCanvas.convertToBlob({ type:mime, quality })
+      reportProgress(message.id, 0.98, 'Finishing output')
       self.postMessage({
         type:'processed',
         id:message.id,

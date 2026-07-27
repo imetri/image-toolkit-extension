@@ -1,4 +1,4 @@
-import type { ProcessOptions } from '../types'
+import type { ProcessOptions, ProcessProgress } from '../types'
 
 const CHANNEL = 'imageflow-raw-decoder'
 
@@ -12,7 +12,7 @@ export type DecodedRawImage = {
 
 type SandboxResponse = {
   channel: typeof CHANNEL
-  type: 'ready' | 'processed' | 'error'
+  type: 'ready' | 'processed' | 'error' | 'progress'
   id?: string
   width?: number
   height?: number
@@ -21,6 +21,8 @@ type SandboxResponse = {
   bitDepth?: number
   blob?: Blob
   error?: string
+  progress?: number
+  stage?: string
 }
 
 let sandboxFrame: HTMLIFrameElement | undefined
@@ -76,6 +78,7 @@ export async function processRawImage(
   file: File,
   options: ProcessOptions,
   signal?: AbortSignal,
+  onProgress?: (update: ProcessProgress) => void,
 ): Promise<ProcessedRawImage> {
   if (signal?.aborted) throw abortError()
   const frame = await ensureSandbox()
@@ -104,6 +107,13 @@ export async function processRawImage(
     const onMessage = (event: MessageEvent<SandboxResponse>) => {
       const message = event.data
       if (event.source !== frame.contentWindow || message?.channel !== CHANNEL || message.id !== id) return
+      if (message.type === 'progress') {
+        onProgress?.({
+          progress:Math.max(0, Math.min(1, message.progress ?? 0)),
+          stage:message.stage || 'Processing RAW image',
+        })
+        return
+      }
       cleanup()
       if (message.type === 'error') {
         reject(new Error(message.error || 'Unable to decode the RAW file.'))

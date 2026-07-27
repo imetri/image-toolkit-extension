@@ -9,7 +9,11 @@ const yieldToBrowser = () => new Promise<void>(resolve => globalThis.setTimeout(
  * Processing is row-buffered so a full-resolution image does not need another
  * frame-sized working allocation.
  */
-export async function applyRawCaptureSharpening(image: DecodedRawImage, signal?: AbortSignal) {
+export async function applyRawCaptureSharpening(
+  image: DecodedRawImage,
+  signal?: AbortSignal,
+  onProgress?: (progress: number) => void,
+) {
   if (!(image.data instanceof Uint16Array) || image.bits !== 16 || image.colors < 3) return image
   if (image.width < 3 || image.height < 3) return image
 
@@ -21,7 +25,10 @@ export async function applyRawCaptureSharpening(image: DecodedRawImage, signal?:
 
   for (let y = 0; y < height; y += 1) {
     if ((y & 31) === 0 && signal?.aborted) throw abortError()
-    if (y > 0 && (y & 15) === 0) await yieldToBrowser()
+    if (y > 0 && (y & 15) === 0) {
+      onProgress?.(y / height)
+      await yieldToBrowser()
+    }
     const outputRow = y * rowLength
 
     for (let x = 0; x < width; x += 1) {
@@ -58,5 +65,6 @@ export async function applyRawCaptureSharpening(image: DecodedRawImage, signal?:
     below = data.slice(nextRow * rowLength, (nextRow + 1) * rowLength)
   }
 
+  onProgress?.(1)
   return image
 }
