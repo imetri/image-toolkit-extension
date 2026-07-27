@@ -509,6 +509,40 @@ export default function App() {
                       : "Ready to be processed."}
                   </p>
                 </div>
+                {isProcessing && batchProgress && (
+                  <div className="batch-progress" aria-live="polite">
+                    <div className="progress-copy">
+                      <div>
+                        <strong>{batchProgress.stage}</strong>
+                        <span title={batchProgress.filename}>
+                          {batchProgress.filename}
+                        </span>
+                      </div>
+                      <div>
+                        <strong>{batchProgress.percent}%</strong>
+                        <span>
+                          {batchProgress.current} of {batchProgress.total}
+                          {batchProgress.secondsRemaining !== undefined &&
+                          batchProgress.secondsRemaining > 0
+                            ? ` · about ${batchProgress.secondsRemaining < 60
+                              ? `${batchProgress.secondsRemaining}s`
+                              : `${Math.ceil(batchProgress.secondsRemaining / 60)} min`} left`
+                            : ""}
+                        </span>
+                      </div>
+                    </div>
+                    <div
+                      className="progress-track"
+                      role="progressbar"
+                      aria-label={`Processing ${batchProgress.filename}`}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={batchProgress.percent}
+                    >
+                      <span style={{ width:`${batchProgress.percent}%` }} />
+                    </div>
+                  </div>
+                )}
                 <button
                   type="button"
                   onClick={clear}
@@ -537,43 +571,6 @@ export default function App() {
                   </article>
                 ))}
               </div>
-              {isProcessing && batchProgress && (
-                <div className="batch-progress" aria-live="polite">
-                  <div className="progress-copy">
-                    <div>
-                      <strong>{batchProgress.stage}</strong>
-                      <span title={batchProgress.filename}>
-                        {batchProgress.filename}
-                      </span>
-                    </div>
-                    <div>
-                      <strong>{batchProgress.percent}%</strong>
-                      <span>
-                        {batchProgress.current} of {batchProgress.total}
-                        {batchProgress.secondsRemaining !== undefined &&
-                        batchProgress.secondsRemaining > 0
-                          ? ` · about ${batchProgress.secondsRemaining < 60
-                            ? `${batchProgress.secondsRemaining}s`
-                            : `${Math.ceil(batchProgress.secondsRemaining / 60)} min`} left`
-                          : ""}
-                      </span>
-                    </div>
-                  </div>
-                  <div
-                    className="progress-track"
-                    role="progressbar"
-                    aria-label={`Processing ${batchProgress.filename}`}
-                    aria-valuemin={0}
-                    aria-valuemax={100}
-                    aria-valuenow={batchProgress.percent}
-                  >
-                    <span style={{ width:`${batchProgress.percent}%` }} />
-                  </div>
-                  <small>
-                    Keep this tab open. Large RAW files can take longer at full quality.
-                  </small>
-                </div>
-              )}
             </motion.section>
           )}
         </AnimatePresence>

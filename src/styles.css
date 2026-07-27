@@ -544,13 +544,13 @@ main {
 }
 
 .batch-progress {
-  padding: 14px 22px 17px;
-  border-top: 1px solid var(--border);
-  background: #fff;
+  min-width: 220px;
+  max-width: 1200px;
+  flex: 1;
 }
 
 .progress-copy {
-  margin-bottom: 9px;
+  margin-bottom: 7px;
   display: flex;
   align-items: flex-end;
   justify-content: space-between;
@@ -587,7 +587,7 @@ main {
 }
 
 .progress-track {
-  height: 7px;
+  height: 6px;
   overflow: hidden;
   border-radius: 10px;
   background: var(--soft);
@@ -599,10 +599,6 @@ main {
   border-radius: inherit;
   background: var(--purple);
   transition: width 180ms ease;
-}
-
-.batch-progress > small {
-  display: block;
 }
 
 .queue-list article,
@@ -762,6 +758,11 @@ main {
   .card-heading {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .batch-progress {
+    width: 100%;
+    max-width: none;
   }
 
   .result-actions {
