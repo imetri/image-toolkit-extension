@@ -2,6 +2,7 @@ import { useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import JSZip from "jszip";
 import {
+  Archive,
   ArrowDownToLine,
   ArrowLeftRight,
   Check,
@@ -164,6 +165,15 @@ export default function App() {
     anchor.download = item.name;
     anchor.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  const downloadAllFiles = () => {
+    results.forEach((item, index) => {
+      setTimeout(() => downloadFile(item), index * 150);
+    });
+    setNotice(
+      `${results.length} ${results.length === 1 ? "file is" : "files are"} downloading.`,
+    );
   };
 
   const downloadZip = async () => {
@@ -515,10 +525,13 @@ export default function App() {
                 </div>
                 <div className="result-actions">
                   <Button variant="secondary" onClick={clear}>
-                    Start over
+                    Clear
+                  </Button>
+                  <Button variant="secondary" onClick={downloadAllFiles}>
+                    <ArrowDownToLine size={17} /> Download all
                   </Button>
                   <Button onClick={downloadZip}>
-                    <ArrowDownToLine size={17} /> Download all
+                    <Archive size={17} /> Download as ZIP
                   </Button>
                 </div>
               </div>
