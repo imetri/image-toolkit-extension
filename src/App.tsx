@@ -176,7 +176,7 @@ export default function App() {
     addFiles(event.dataTransfer.files);
   };
   return (
-    <div className={`app ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
+    <div className="app">
       <aside className="sidebar">
         <div className="sidebar-header">
           <div className="brand">
@@ -234,6 +234,13 @@ export default function App() {
       <main className="main">
         <header className="topbar">
           <div>
+            <div className="brand topbar-brand">
+              <div className="brand-mark">
+                <Zap size={16} fill="currentColor" />
+              </div>
+              <span className="brand-name">imageflow</span>
+              <span className="version">BETA</span>
+            </div>
             <div className="eyebrow">WORKSPACE / IMAGE WORKFLOW</div>
             <h1>Batch image workflow</h1>
           </div>

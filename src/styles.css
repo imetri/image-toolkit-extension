@@ -19,3 +19,7 @@
  .step{display:none}
  .process-btn{color:#fff}
  .sidebar-footer .privacy{display:none}
+ .sidebar{display:none}
+ .main{width:100%}
+ .topbar-brand{padding:0;gap:9px;margin-bottom:4px}
+ .topbar-brand .brand-name{font-size:15px}
