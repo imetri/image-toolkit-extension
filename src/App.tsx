@@ -9,6 +9,7 @@ import {
   ChevronDown,
   CircleMinus,
   Download,
+  Eraser,
   Maximize2,
   Play,
   Plus,
@@ -57,6 +58,12 @@ const operations: Array<{
     label: "Compress",
     description: "Reduce file size",
     icon: CircleMinus,
+  },
+  {
+    value: "remove-background",
+    label: "Remove background",
+    description: "Full-resolution transparent PNG",
+    icon: Eraser,
   },
 ];
 
@@ -122,6 +129,7 @@ export default function App() {
     let completed = 0;
     let failed = 0;
     let nextIndex = 0;
+    const failureMessages: string[] = [];
     const completedIds: string[] = [];
     const itemProgress = new Map(pending.map(item => [item.id, 0]));
     const updateProgress = (
@@ -159,7 +167,12 @@ export default function App() {
             item,
             {
               operation,
-              format: operation === "resize" ? "original" : format,
+              format:
+                operation === "resize"
+                  ? "original"
+                  : operation === "remove-background"
+                    ? "png"
+                    : format,
               keepAspect,
               quality,
               width,
@@ -182,17 +195,24 @@ export default function App() {
             1,
             completed === pending.length ? "Complete" : "Preparing next image",
           );
-        } catch {
+        } catch (error) {
           if (!controller.signal.aborted) {
             itemProgress.set(item.id, 1);
             failed += 1;
+            const message = error instanceof Error
+              ? error.message
+              : "Unknown processing error";
+            failureMessages.push(`${item.file.name}: ${message}`);
+            console.error(`Could not process ${item.file.name}`, error);
           }
         }
       }
     };
 
     const containsRaw = pending.some(item => isRawImage(item.file));
-    const concurrency = containsRaw
+    const concurrency = operation === "remove-background"
+      ? 1
+      : containsRaw
       ? Math.min(rawProcessingConcurrency(), pending.length)
       : Math.min(3, pending.length);
     await Promise.all(
@@ -207,7 +227,9 @@ export default function App() {
       if (!controller.signal.aborted) {
         setNotice(
           failed
-            ? `${completed} ready, ${failed} could not be processed.`
+            ? `${completed} ready, ${failed} could not be processed. ${
+              failureMessages[0] || ""
+            }`
             : `${completed} ${completed === 1 ? "image is" : "images are"} ready.`,
         );
       }
@@ -265,8 +287,11 @@ export default function App() {
     addSelectedFiles(event.dataTransfer.files);
   };
 
+  const operationAction = operation === "remove-background"
+    ? "Remove background from"
+    : `${operation[0].toUpperCase()}${operation.slice(1)}`;
   const actionLabel = items.length
-    ? `${operation[0].toUpperCase()}${operation.slice(1)} ${items.length} ${
+    ? `${operationAction} ${items.length} ${
         items.length === 1 ? "image" : "images"
       }`
     : "Process images";
@@ -403,6 +428,13 @@ export default function App() {
                     <ChevronDown size={16} />
                   </span>
                 </label>
+              )}
+
+              {operation === "remove-background" && (
+                <div className="background-output-note">
+                  <strong>Lossless full-resolution PNG</strong>
+                  <span>Refined edges · processed privately on this device</span>
+                </div>
               )}
 
               {operation === "resize" && (

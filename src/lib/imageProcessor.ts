@@ -2,6 +2,7 @@ import type { ImageItem, ProcessOptions, ProcessedItem, ProcessProgress } from '
 import { extensionFor, newId, outputMime } from './utils'
 import { isRawImage } from './imageFormats'
 import { processRawImage } from './rawDecoder'
+import { removeImageBackground } from './backgroundRemoval'
 
 const abortError = () => new DOMException('Image processing was cancelled', 'AbortError')
 
@@ -49,6 +50,46 @@ function encodingQuality(options: ProcessOptions, mime: string) {
 export async function processImage(item: ImageItem, options: ProcessOptions, signal?: AbortSignal, onProgress?: (update: ProcessProgress) => void): Promise<ProcessedItem> {
   if (signal?.aborted) throw abortError()
   const raw = isRawImage(item.file)
+  if (options.operation === 'remove-background') {
+    let input: Blob = item.file
+    if (raw) {
+      const decoded = await processRawImage(
+        item.file,
+        { ...options, format:'png' },
+        signal,
+        update => onProgress?.({
+          progress:update.progress * 0.42,
+          stage:update.stage,
+        }),
+      )
+      input = decoded.blob
+    }
+    const processed = await removeImageBackground(
+      input,
+      signal,
+      update => onProgress?.({
+        progress:raw
+          ? 0.42 + update.progress * 0.58
+          : update.progress,
+        stage:update.stage,
+      }),
+    )
+    const base = item.file.name.replace(/\.[^/.]+$/, '')
+    const blob = processed.blob
+    onProgress?.({ progress:1, stage:'Complete' })
+    return {
+      id:newId(),
+      sourceName:item.file.name,
+      name:`${base}-no-bg.png`,
+      blob,
+      preview:URL.createObjectURL(blob),
+      originalSize:item.file.size,
+      outputSize:blob.size,
+      width:processed.width,
+      height:processed.height,
+      status:'done',
+    }
+  }
   const requestedMime = raw && options.format === 'original'
     ? 'image/jpeg'
     : outputMime(options.format, item.file.type)

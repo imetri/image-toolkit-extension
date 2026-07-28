@@ -304,7 +304,7 @@ main {
 .operation-tabs {
   padding: 0 26px 13px;
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 10px;
 }
 
@@ -423,6 +423,24 @@ main {
 .settings label:has(.select-wrap.short) {
   min-width: 130px;
   width: 130px;
+}
+
+.background-output-note {
+  min-height: 44px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 5px;
+}
+
+.background-output-note strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.background-output-note span {
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .toggle {

@@ -10,6 +10,7 @@ ImageFlow is a privacy-first Chrome Extension for fast batch image workflows. It
 - Convert to PNG, JPG, WebP, or AVIF.
 - Resize by width, height, or percentage with optional aspect-ratio locking.
 - Compress with an adjustable quality control.
+- Remove portrait backgrounds locally and export transparent PNG files.
 - Preview processed results and download the whole batch as a ZIP.
 - Dark and light mode with a Linear/Raycast-inspired workspace UI.
 
@@ -42,6 +43,13 @@ development also applies DCB demosaicing, light pre-demosaic noise cleanup,
 highlight blending, color-artifact suppression, and restrained 16-bit capture
 sharpening.
 
+Background removal uses a bundled, MIT-licensed 512×512 BiRefNet-lite browser
+export through Transformers.js. The half-precision model stays loaded in a
+dedicated worker across a batch, uses local WebAssembly inference for broad
+device compatibility, and never uploads the source image. A subject-aware
+second pass refines the matte before it is applied directly to the original
+decoded pixels and exported as a full-resolution, lossless PNG.
+
 Premium readiness is intentionally represented at the workflow boundary: each future operation can be modeled as a typed operation and checked before `processImage` is called. Payments and account state are not included in the MVP.
 
 ## Chrome Web Store preparation
@@ -66,7 +74,7 @@ Premium readiness is intentionally represented at the workflow boundary: each fu
 1. Worker pool and visible per-file progress.
 2. Presets and premium batch limits behind a feature-entitlement interface.
 3. Batch rename and metadata removal.
-4. Watermark, OCR, and background removal as composable pipeline stages.
+4. Watermark and OCR as composable pipeline stages.
 5. Folder intake and saved workflow automation.
 
 ## License
