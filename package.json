@@ -6,9 +6,11 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "postbuild": "node scripts/prepare-sites.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
     "framer-motion": "^11.11.17",
     "jszip": "^3.10.1",
     "libraw-wasm": "^1.6.0",

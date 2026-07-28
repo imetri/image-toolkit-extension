@@ -1,9 +1,8 @@
-import type { ImageItem, ProcessOptions, ProcessedItem } from '../types'
+import type { ImageItem, ProcessOptions, ProcessedItem, ProcessProgress } from '../types'
 import { extensionFor, newId, outputMime } from './utils'
 import { isRawImage } from './imageFormats'
-import { decodeRawImage } from './rawDecoder'
-import { encodeRawPng16 } from './pngEncoder'
-import { applyRawCaptureSharpening } from './rawEnhance'
+import { processRawImage } from './rawDecoder'
+import { removeImageBackground } from './backgroundRemoval'
 
 const abortError = () => new DOMException('Image processing was cancelled', 'AbortError')
 
@@ -24,13 +23,21 @@ const decode = (file: Blob, signal?: AbortSignal) => new Promise<HTMLImageElemen
   image.src = url
 })
 
-const processInWorker = (item: ImageItem, options: ProcessOptions, signal?: AbortSignal) => new Promise<ProcessedItem>((resolve, reject) => {
+const processInWorker = (item: ImageItem, options: ProcessOptions, signal?: AbortSignal, onProgress?: (update: ProcessProgress) => void) => new Promise<ProcessedItem>((resolve, reject) => {
   const worker = new Worker(new URL('../workers/image.worker.ts', import.meta.url), { type:'module' })
   const cleanup = () => signal?.removeEventListener('abort', cancel)
   const cancel = () => { worker.terminate(); cleanup(); reject(abortError()) }
   if (signal?.aborted) return cancel()
   signal?.addEventListener('abort', cancel, { once: true })
-  worker.onmessage = ({ data }) => { worker.terminate(); cleanup(); data.error ? reject(new Error(data.error)) : resolve({ ...data, preview:URL.createObjectURL(data.blob) }) }
+  worker.onmessage = ({ data }) => {
+    if (data.type === 'progress') {
+      onProgress?.({ progress:data.progress, stage:data.stage })
+      return
+    }
+    worker.terminate()
+    cleanup()
+    data.error ? reject(new Error(data.error)) : resolve({ ...data, preview:URL.createObjectURL(data.blob) })
+  }
   worker.onerror = error => { worker.terminate(); cleanup(); reject(error) }
   worker.postMessage({ item:{ id:item.id, file:item.file }, options })
 })
@@ -40,69 +47,73 @@ function encodingQuality(options: ProcessOptions, mime: string) {
   return options.operation === 'compress' ? options.quality / 100 : 1
 }
 
-function rawPixelsToCanvas(
-  image: Awaited<ReturnType<typeof decodeRawImage>>,
-  signal?: AbortSignal,
-) {
-  if (signal?.aborted) throw abortError()
-  const pixelCount = image.width * image.height
-  if (image.colors < 1 || image.data.length < pixelCount * image.colors) {
-    throw new Error('The RAW decoder returned incomplete pixel data.')
-  }
-
-  const rgba = new Uint8ClampedArray(pixelCount * 4)
-  const max = image.bits > 8 ? 65535 : 255
-  for (let pixel = 0; pixel < pixelCount; pixel += 1) {
-    if ((pixel & 0x3ffff) === 0 && signal?.aborted) throw abortError()
-    const source = pixel * image.colors
-    const target = pixel * 4
-    const red = image.data[source]
-    const green = image.data[source + Math.min(1, image.colors - 1)]
-    const blue = image.data[source + Math.min(2, image.colors - 1)]
-    rgba[target] = Math.round(red * 255 / max)
-    rgba[target + 1] = Math.round(green * 255 / max)
-    rgba[target + 2] = Math.round(blue * 255 / max)
-    rgba[target + 3] = 255
-  }
-
-  const canvas = document.createElement('canvas')
-  canvas.width = image.width
-  canvas.height = image.height
-  canvas.getContext('2d', { alpha:false })!.putImageData(new ImageData(rgba, image.width, image.height), 0, 0)
-  return canvas
-}
-
-async function decodeRawSource(file: File, signal?: AbortSignal) {
-  const fullImage = applyRawCaptureSharpening(await decodeRawImage(file, signal), signal)
-  return { image:rawPixelsToCanvas(fullImage, signal) }
-}
-
-export async function processImage(item: ImageItem, options: ProcessOptions, signal?: AbortSignal): Promise<ProcessedItem> {
+export async function processImage(item: ImageItem, options: ProcessOptions, signal?: AbortSignal, onProgress?: (update: ProcessProgress) => void): Promise<ProcessedItem> {
   if (signal?.aborted) throw abortError()
   const raw = isRawImage(item.file)
-  const requestedMime = raw && options.format === 'original'
-    ? 'image/jpeg'
-    : outputMime(options.format, item.file.type)
-  const originalMime = item.file.type === 'image/jpg' ? 'image/jpeg' : item.file.type
-  if (raw && requestedMime === 'image/png' && options.operation !== 'resize') {
-    const decoded = applyRawCaptureSharpening(await decodeRawImage(item.file, signal), signal)
-    const blob = await encodeRawPng16(decoded, signal)
+  if (options.operation === 'remove-background') {
+    let input: Blob = item.file
+    if (raw) {
+      const decoded = await processRawImage(
+        item.file,
+        { ...options, format:'png' },
+        signal,
+        update => onProgress?.({
+          progress:update.progress * 0.42,
+          stage:update.stage,
+        }),
+      )
+      input = decoded.blob
+    }
+    const processed = await removeImageBackground(
+      input,
+      signal,
+      update => onProgress?.({
+        progress:raw
+          ? 0.42 + update.progress * 0.58
+          : update.progress,
+        stage:update.stage,
+      }),
+    )
     const base = item.file.name.replace(/\.[^/.]+$/, '')
+    const blob = processed.blob
+    onProgress?.({ progress:1, stage:'Complete' })
     return {
       id:newId(),
       sourceName:item.file.name,
-      name:`${base}.png`,
+      name:`${base}-no-bg.png`,
       blob,
       preview:URL.createObjectURL(blob),
       originalSize:item.file.size,
       outputSize:blob.size,
-      width:decoded.width,
-      height:decoded.height,
-      bitDepth:16,
+      width:processed.width,
+      height:processed.height,
+      status:'done',
+    }
+  }
+  const requestedMime = raw && options.format === 'original'
+    ? 'image/jpeg'
+    : outputMime(options.format, item.file.type)
+  const originalMime = item.file.type === 'image/jpg' ? 'image/jpeg' : item.file.type
+  if (raw) {
+    const processed = await processRawImage(item.file, options, signal, onProgress)
+    const blob = processed.blob
+    const base = item.file.name.replace(/\.[^/.]+$/, '')
+    return {
+      id:newId(),
+      sourceName:item.file.name,
+      name:`${base}.${extensionFor(blob.type || requestedMime)}`,
+      blob,
+      preview:URL.createObjectURL(blob),
+      originalSize:item.file.size,
+      outputSize:blob.size,
+      width:processed.width,
+      height:processed.height,
+      bitDepth:processed.bitDepth,
       status:'done',
     }
   }
   if (!raw && options.operation === 'convert' && originalMime === requestedMime) {
+    onProgress?.({ progress:1, stage:'Already in the requested format' })
     const blob = item.file.slice(0, item.file.size, requestedMime)
     return {
       id:newId(),
@@ -116,23 +127,26 @@ export async function processImage(item: ImageItem, options: ProcessOptions, sig
     }
   }
   if (!raw && typeof Worker !== 'undefined' && typeof OffscreenCanvas !== 'undefined' && typeof createImageBitmap !== 'undefined') {
-    try { return await processInWorker(item, options, signal) } catch (error) {
+    try { return await processInWorker(item, options, signal, onProgress) } catch (error) {
       if (signal?.aborted) throw error
       /* Some browsers cannot encode every requested format off-thread. */
     }
   }
-  const rawSource = raw ? await decodeRawSource(item.file, signal) : undefined
-  const image = rawSource?.image ?? await decode(item.file, signal)
+  onProgress?.({ progress:0.08, stage:'Reading image' })
+  const image = await decode(item.file, signal)
+  onProgress?.({ progress:0.35, stage:'Preparing image' })
   if (signal?.aborted) throw abortError()
   const scale = options.operation === 'resize' ? (options.percentage ? options.percentage / 100 : Math.min(options.width ? options.width / image.width : 1, options.height ? options.height / image.height : 1)) : 1
   const width = Math.max(1, Math.round(options.keepAspect ? image.width * scale : (options.width || image.width * scale)))
   const height = Math.max(1, Math.round(options.keepAspect ? image.height * scale : (options.height || image.height * scale)))
   const canvas = document.createElement('canvas'); canvas.width = width; canvas.height = height
   canvas.getContext('2d', { alpha:requestedMime !== 'image/jpeg' })!.drawImage(image, 0, 0, width, height)
+  onProgress?.({ progress:0.65, stage:'Encoding output image' })
   const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob(value => value ? resolve(value) : reject(new Error('Unable to encode image')), requestedMime, encodingQuality(options, requestedMime)))
   if (image instanceof HTMLImageElement) URL.revokeObjectURL(image.src)
   const mime = blob.type || requestedMime
   const base = item.file.name.replace(/\.[^/.]+$/, '')
   const name = `${base}.${extensionFor(mime)}`
+  onProgress?.({ progress:1, stage:'Complete' })
   return { id:newId(), sourceName:item.file.name, name, blob, preview:URL.createObjectURL(blob), originalSize:item.file.size, outputSize:blob.size, width, height, status:'done' }
 }

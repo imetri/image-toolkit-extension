@@ -1,6 +1,7 @@
 import type { DecodedRawImage } from './rawDecoder'
 
 const abortError = () => new DOMException('Image processing was cancelled', 'AbortError')
+const yieldToBrowser = () => new Promise<void>(resolve => globalThis.setTimeout(resolve, 0))
 
 /**
  * Applies restrained capture sharpening to developed 16-bit RAW pixels.
@@ -8,7 +9,11 @@ const abortError = () => new DOMException('Image processing was cancelled', 'Abo
  * Processing is row-buffered so a full-resolution image does not need another
  * frame-sized working allocation.
  */
-export function applyRawCaptureSharpening(image: DecodedRawImage, signal?: AbortSignal) {
+export async function applyRawCaptureSharpening(
+  image: DecodedRawImage,
+  signal?: AbortSignal,
+  onProgress?: (progress: number) => void,
+) {
   if (!(image.data instanceof Uint16Array) || image.bits !== 16 || image.colors < 3) return image
   if (image.width < 3 || image.height < 3) return image
 
@@ -20,6 +25,10 @@ export function applyRawCaptureSharpening(image: DecodedRawImage, signal?: Abort
 
   for (let y = 0; y < height; y += 1) {
     if ((y & 31) === 0 && signal?.aborted) throw abortError()
+    if (y > 0 && (y & 63) === 0) {
+      onProgress?.(y / height)
+      await yieldToBrowser()
+    }
     const outputRow = y * rowLength
 
     for (let x = 0; x < width; x += 1) {
@@ -50,11 +59,14 @@ export function applyRawCaptureSharpening(image: DecodedRawImage, signal?: Abort
       }
     }
 
+    const reusableRow = above
     above = center
     center = below
     const nextRow = Math.min(height - 1, y + 2)
-    below = data.slice(nextRow * rowLength, (nextRow + 1) * rowLength)
+    below = reusableRow
+    below.set(data.subarray(nextRow * rowLength, (nextRow + 1) * rowLength))
   }
 
+  onProgress?.(1)
   return image
 }

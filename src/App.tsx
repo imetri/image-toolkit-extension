@@ -1,8 +1,6 @@
 import { useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import JSZip from "jszip";
-import { useForm } from "react-hook-form";
-import { z } from "zod";
 import {
   Archive,
   ArrowDownToLine,
@@ -10,17 +8,11 @@ import {
   Check,
   ChevronDown,
   CircleMinus,
-  CornerDownLeft,
   Download,
-  FileImage,
-  ImagePlus,
+  Eraser,
   Maximize2,
-  MoreHorizontal,
-  PanelLeftClose,
-  PanelLeftOpen,
   Play,
   Plus,
-  RefreshCw,
   Trash2,
   UploadCloud,
   X,
@@ -29,17 +21,51 @@ import {
 import { Button, Toggle } from "./components/ui";
 import { useImageQueue } from "./hooks/useImageQueue";
 import { processImage } from "./lib/imageProcessor";
-import { IMAGE_FILE_ACCEPT } from "./lib/imageFormats";
+import { IMAGE_FILE_ACCEPT, isRawImage } from "./lib/imageFormats";
+import { rawProcessingConcurrency } from "./lib/rawDecoder";
 import { formatBytes } from "./lib/utils";
 import type { Operation, OutputFormat, ProcessedItem } from "./types";
 
-const schema = z.object({
-  width: z.coerce.number().min(1).optional(),
-  height: z.coerce.number().min(1).optional(),
-  percentage: z.coerce.number().min(1).max(1000).optional(),
-  quality: z.coerce.number().min(1).max(100),
-});
-type FormValues = z.infer<typeof schema>;
+type BatchProgress = {
+  current: number;
+  total: number;
+  filename: string;
+  percent: number;
+  stage: string;
+  secondsRemaining?: number;
+};
+
+const operations: Array<{
+  value: Operation;
+  label: string;
+  description: string;
+  icon: typeof ArrowLeftRight;
+}> = [
+  {
+    value: "convert",
+    label: "Convert",
+    description: "Change file format",
+    icon: ArrowLeftRight,
+  },
+  {
+    value: "resize",
+    label: "Resize",
+    description: "Set dimensions",
+    icon: Maximize2,
+  },
+  {
+    value: "compress",
+    label: "Compress",
+    description: "Reduce file size",
+    icon: CircleMinus,
+  },
+  {
+    value: "remove-background",
+    label: "Remove background",
+    description: "Full-resolution transparent PNG",
+    icon: Eraser,
+  },
+];
 
 export default function App() {
   const { items, addFiles, remove, clear: clearQueue } = useImageQueue();
@@ -49,113 +75,198 @@ export default function App() {
   const [format, setFormat] = useState<OutputFormat>("webp");
   const [isDragging, setDragging] = useState(false);
   const [isProcessing, setProcessing] = useState(false);
+  const [batchProgress, setBatchProgress] = useState<BatchProgress | null>(null);
   const [results, setResults] = useState<ProcessedItem[]>([]);
   const [notice, setNotice] = useState("");
   const [keepAspect, setKeepAspect] = useState(true);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const { register, watch, setValue } = useForm<FormValues>({
-    defaultValues: { quality: 82, percentage: 100 },
-  });
-  const quality = watch("quality") || 82;
+  const [width, setWidth] = useState<number | undefined>();
+  const [height, setHeight] = useState<number | undefined>();
+  const [percentage, setPercentage] = useState<number | undefined>(100);
+  const [quality, setQuality] = useState(82);
+
+  const totalInputSize = useMemo(
+    () => items.reduce((sum, item) => sum + item.file.size, 0),
+    [items],
+  );
   const savings = useMemo(
     () =>
       results.reduce(
-        (sum, item) => sum + item.originalSize - item.outputSize,
+        (sum, item) => sum + Math.max(0, item.originalSize - item.outputSize),
         0,
       ),
     [results],
   );
+
+  const addSelectedFiles = (files: FileList | null) => {
+    if (!files?.length) return;
+    addFiles(files);
+    setNotice(
+      `${files.length} ${files.length === 1 ? "image" : "images"} added.`,
+    );
+  };
+
   const run = async () => {
     if (!items.length) {
-      setNotice("Add at least one image to get started.");
+      inputRef.current?.click();
       return;
     }
-    processingRef.current?.abort();
+    if (isProcessing) return;
+
     const controller = new AbortController();
+    processingRef.current?.abort();
     processingRef.current = controller;
+    const pending = [...items];
     setProcessing(true);
+    const startedAt = performance.now();
+    setBatchProgress({
+      current:1,
+      total:pending.length,
+      filename:pending[0].file.name,
+      percent:0,
+      stage:"Preparing image",
+    });
+
     let completed = 0;
     let failed = 0;
-    let firstFailure = "";
-    const pendingItems = [...items];
-    for (const [index, item] of pendingItems.entries()) {
-      if (controller.signal.aborted) break;
-      setNotice(
-        `Processing ${index + 1} of ${pendingItems.length}: ${item.file.name}`,
-      );
-      try {
-        const processed = await processImage(
-          item,
-          {
-            operation,
-            format: operation === "resize" ? "original" : format,
-            keepAspect,
-            quality,
-            width: watch("width"),
-            height: watch("height"),
-            percentage: watch("percentage"),
-          },
-          controller.signal,
-        );
-        if (controller.signal.aborted) {
-          URL.revokeObjectURL(processed.preview);
-          break;
-        }
-        setResults((current) => [...current, processed]);
-        remove(item.id);
-        completed += 1;
-      } catch (error) {
-        if (controller.signal.aborted) break;
-        failed += 1;
-        if (!firstFailure) {
-          firstFailure =
-            error instanceof Error ? error.message : "Unknown processing error";
+    let nextIndex = 0;
+    const failureMessages: string[] = [];
+    const completedIds: string[] = [];
+    const itemProgress = new Map(pending.map(item => [item.id, 0]));
+    const updateProgress = (
+      item: (typeof pending)[number],
+      progress: number,
+      stage: string,
+    ) => {
+      itemProgress.set(item.id, progress);
+      const overallProgress = [...itemProgress.values()]
+        .reduce((sum, value) => sum + value, 0) / pending.length;
+      const elapsedSeconds = (performance.now() - startedAt) / 1000;
+      const secondsRemaining = overallProgress > 0.03
+        ? Math.max(0, Math.round(
+            elapsedSeconds / overallProgress - elapsedSeconds,
+          ))
+        : undefined;
+      setBatchProgress({
+        current:Math.min(completed + 1, pending.length),
+        total:pending.length,
+        filename:item.file.name,
+        percent:Math.min(99, Math.round(overallProgress * 100)),
+        stage,
+        secondsRemaining,
+      });
+    };
+
+    const processNext = async () => {
+      while (!controller.signal.aborted) {
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= pending.length) return;
+        const item = pending[index];
+        try {
+          const processed = await processImage(
+            item,
+            {
+              operation,
+              format:
+                operation === "resize"
+                  ? "original"
+                  : operation === "remove-background"
+                    ? "png"
+                    : format,
+              keepAspect,
+              quality,
+              width,
+              height,
+              percentage,
+            },
+            controller.signal,
+            ({ progress, stage }) => updateProgress(item, progress, stage),
+          );
+          if (controller.signal.aborted) {
+            URL.revokeObjectURL(processed.preview);
+            return;
+          }
+          itemProgress.set(item.id, 1);
+          setResults((current) => [...current, processed]);
+          completedIds.push(item.id);
+          completed += 1;
+          updateProgress(
+            item,
+            1,
+            completed === pending.length ? "Complete" : "Preparing next image",
+          );
+        } catch (error) {
+          if (!controller.signal.aborted) {
+            itemProgress.set(item.id, 1);
+            failed += 1;
+            const message = error instanceof Error
+              ? error.message
+              : "Unknown processing error";
+            failureMessages.push(`${item.file.name}: ${message}`);
+            console.error(`Could not process ${item.file.name}`, error);
+          }
         }
       }
-    }
+    };
+
+    const containsRaw = pending.some(item => isRawImage(item.file));
+    const concurrency = operation === "remove-background"
+      ? 1
+      : containsRaw
+      ? Math.min(rawProcessingConcurrency(), pending.length)
+      : Math.min(3, pending.length);
+    await Promise.all(
+      Array.from({ length:concurrency }, () => processNext()),
+    );
+
     if (processingRef.current === controller) {
+      completedIds.forEach(remove);
       processingRef.current = null;
       setProcessing(false);
+      setBatchProgress(null);
       if (!controller.signal.aborted) {
-        const readyMessage = `${completed} ${completed === 1 ? "image is" : "images are"} ready.`;
-        const failedMessage = failed
-          ? ` ${failed} could not be processed: ${firstFailure}`
-          : "";
-        setNotice(`${readyMessage}${failedMessage}`);
+        setNotice(
+          failed
+            ? `${completed} ready, ${failed} could not be processed. ${
+              failureMessages[0] || ""
+            }`
+            : `${completed} ${completed === 1 ? "image is" : "images are"} ready.`,
+        );
       }
     }
   };
+
   const clear = () => {
     processingRef.current?.abort();
     processingRef.current = null;
     setProcessing(false);
+    setBatchProgress(null);
     results.forEach((item) => {
       if (item.preview.startsWith("blob:")) URL.revokeObjectURL(item.preview);
     });
     setResults([]);
     clearQueue();
-    setNotice("Queue cleared.");
   };
+
   const downloadFile = (item: ProcessedItem) => {
     const url = URL.createObjectURL(item.blob);
     const anchor = document.createElement("a");
     anchor.href = url;
     anchor.download = item.name;
-    document.body.appendChild(anchor);
     anchor.click();
-    anchor.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
-  const downloadFiles = () => {
-    results.forEach((item, index) =>
-      setTimeout(() => downloadFile(item), index * 150),
-    );
+
+  const downloadAllFiles = () => {
+    results.forEach((item, index) => {
+      setTimeout(() => downloadFile(item), index * 150);
+    });
     setNotice(
-      `${results.length} standalone ${results.length === 1 ? "file is" : "files are"} downloading.`,
+      `${results.length} ${results.length === 1 ? "file is" : "files are"} downloading.`,
     );
   };
+
   const downloadZip = async () => {
-    if (!results.length) return;
     const zip = new JSZip();
     results.forEach((item) => zip.file(item.name, item.blob));
     const blob = await zip.generateAsync({
@@ -167,397 +278,429 @@ export default function App() {
     anchor.href = url;
     anchor.download = `imageflow-export-${new Date().toISOString().slice(0, 10)}.zip`;
     anchor.click();
-    URL.revokeObjectURL(url);
-    setNotice("ZIP downloaded successfully.");
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
+
   const onDrop = (event: React.DragEvent) => {
     event.preventDefault();
     setDragging(false);
-    addFiles(event.dataTransfer.files);
+    addSelectedFiles(event.dataTransfer.files);
   };
+
+  const operationAction = operation === "remove-background"
+    ? "Remove background from"
+    : `${operation[0].toUpperCase()}${operation.slice(1)}`;
+  const actionLabel = items.length
+    ? `${operationAction} ${items.length} ${
+        items.length === 1 ? "image" : "images"
+      }`
+    : "Process images";
+
   return (
     <div className="app">
-      <aside className="sidebar">
-        <div className="sidebar-header">
-          <div className="brand">
-            <div className="brand-mark">
-              <Zap size={16} fill="currentColor" />
-            </div>
-            <span className="brand-name">imageflow</span>
-            <span className="version">BETA</span>
-          </div>
-          <button
-            className="sidebar-toggle"
-            aria-label={
-              sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"
-            }
-            onClick={() => setSidebarCollapsed((value) => !value)}
-          >
-            {sidebarCollapsed ? (
-              <PanelLeftOpen size={16} />
-            ) : (
-              <PanelLeftClose size={16} />
-            )}
-          </button>
+      <header className="topbar">
+        <div className="brand">
+          <span className="brand-mark">
+            <Zap size={19} fill="currentColor" />
+          </span>
+          <strong>imageflow</strong>
+          <span>BETA</span>
         </div>
-        <div className="sidebar-content">
-          <div className="sidebar-group">
-            <div className="side-label">WORKSPACE</div>
-            <button className="nav-item active">
-              <FileImage size={17} />{" "}
-              <span className="nav-text">Image workflow</span>{" "}
-              <span className="nav-count">{items.length || ""}</span>
-            </button>
-            <button className="nav-item muted">
-              <Archive size={17} /> <span className="nav-text">Exports</span>
-            </button>
-          </div>
-        </div>
-        <div className="sidebar-footer">
-          <div className="privacy">
-            <span className="status-dot" />
-            <div className="nav-text">
-              <strong>Local workspace</strong>
-              <small>Your files never leave Chrome</small>
-            </div>
-          </div>
-          <div className="profile">
-            <div className="avatar">IF</div>
-            <div className="nav-text">
-              <strong>Free workspace</strong>
-              <small>Local only · No account</small>
-            </div>
-            <MoreHorizontal className="nav-text" size={17} />
-          </div>
-        </div>
-      </aside>
-      <main className="main">
-        <header className="topbar">
+      </header>
+
+      <main>
+        <section className="hero">
           <div>
-            <div className="brand topbar-brand">
-              <div className="brand-mark">
-                <Zap size={16} fill="currentColor" />
-              </div>
-              <span className="brand-name">imageflow</span>
-              <span className="version">BETA</span>
-            </div>
-            <div className="eyebrow">WORKSPACE / IMAGE WORKFLOW</div>
-            <h1>Batch image workflow</h1>
+            <h1>Move faster with every image.</h1>
+            <p>Convert, resize, and compress your image library in one focused workspace.</p>
           </div>
-          <div className="topbar-actions">
-            <Button
-              variant="secondary"
-              onClick={() => inputRef.current?.click()}
-            >
-              <Plus size={16} /> Add images
-            </Button>
-          </div>
-        </header>
-        <section className="content">
-          <div className="hero">
-            <div>
-              <h2>Move faster with every image.</h2>
-              <p>
-                Convert, resize, and compress your image library in one focused
-                workspace.
-              </p>
-            </div>
-          </div>
-          <div
-            className="dropzone-wrap"
-            onDragEnter={() => setDragging(true)}
-            onDragLeave={() => setDragging(false)}
-            onDragOver={(e) => e.preventDefault()}
-            onDrop={onDrop}
+          <Button
+            className="hero-add"
+            variant="secondary"
+            onClick={() => inputRef.current?.click()}
+            disabled={isProcessing}
           >
-            <motion.div
-              animate={{
-                scale: isDragging ? 1.01 : 1,
-                borderColor: isDragging ? "#b6a0ff" : "var(--border)",
-              }}
-              className="dropzone"
-            >
-              <div className="upload-icon">
-                <UploadCloud size={24} />
+            <Plus size={18} /> Add images
+          </Button>
+        </section>
+
+        <input
+          ref={inputRef}
+          type="file"
+          accept={IMAGE_FILE_ACCEPT}
+          multiple
+          hidden
+          onChange={(event) => {
+            addSelectedFiles(event.target.files);
+            event.target.value = "";
+          }}
+        />
+
+        <motion.button
+          type="button"
+          className={`dropzone ${isDragging ? "dragging" : ""} ${
+            items.length ? "has-files" : ""
+          }`}
+          onClick={() => inputRef.current?.click()}
+          onDragEnter={() => setDragging(true)}
+          onDragLeave={() => setDragging(false)}
+          onDragOver={(event) => event.preventDefault()}
+          onDrop={onDrop}
+          whileHover={{ y: -1 }}
+          disabled={isProcessing}
+        >
+          {items.length ? (
+            <>
+              <div className="file-summary">
+                <div className="thumbs" aria-hidden="true">
+                  {items.slice(0, 4).map((item) => (
+                    <img key={item.id} src={item.preview} alt="" />
+                  ))}
+                </div>
+                <div>
+                  <strong>
+                    {items.length} {items.length === 1 ? "image" : "images"} ready
+                  </strong>
+                  <span>{formatBytes(totalInputSize)} total · Click to add more</span>
+                </div>
               </div>
-              <h3>
-                {isDragging
-                  ? "Drop your images here"
-                  : "Drop images to get started"}
-              </h3>
-              <p>
-                or{" "}
-                <button onClick={() => inputRef.current?.click()}>
-                  browse from your computer
-                </button>
-              </p>
-              <span className="drop-hint">
-                All image formats · Camera RAW <i /> Up to 500 images
+            </>
+          ) : (
+            <>
+              <span className="upload-icon">
+                <UploadCloud size={27} />
               </span>
-              <input
-                ref={inputRef}
-                type="file"
-                accept={IMAGE_FILE_ACCEPT}
-                multiple
-                hidden
-                onChange={(e) => {
-                  if (e.target.files) addFiles(e.target.files);
-                  e.target.value = "";
-                }}
-              />
-            </motion.div>
+              <strong>{isDragging ? "Drop images here" : "Drop images to get started"}</strong>
+              <span>
+                or <em>browse from your computer</em>
+              </span>
+              <small>All image formats · Camera RAW</small>
+            </>
+          )}
+        </motion.button>
+
+        <section className="workflow-card">
+          <div className="workflow-heading">
+            <h2>Workflow</h2>
+            <p>Choose what you want to do with your images.</p>
           </div>
-          <section className="panel">
-            <div className="panel-head">
-              <div>
-                <h3>Workflow</h3>
-                <p>Choose what you want to do with your images.</p>
-              </div>
-              <span className="step">
-                <span>1</span> Configure
-              </span>
-            </div>
-            <div className="mode-tabs">
-              {(["convert", "resize", "compress"] as Operation[]).map(
-                (value) => (
-                  <button
-                    key={value}
-                    className={operation === value ? "selected" : ""}
-                    onClick={() => setOperation(value)}
-                  >
-                    <span className="mode-icon">
-                      {value === "convert" ? (
-                        <ArrowLeftRight size={16} />
-                      ) : value === "resize" ? (
-                        <Maximize2 size={16} />
-                      ) : (
-                        <CircleMinus size={16} />
-                      )}
-                    </span>
-                    <span>
-                      <strong>{value[0].toUpperCase() + value.slice(1)}</strong>
-                      <small>
-                        {value === "convert"
-                          ? "Change file format"
-                          : value === "resize"
-                            ? "Set dimensions"
-                            : "Reduce file size"}
-                      </small>
-                    </span>
-                    {operation === value && <Check size={16} />}
-                  </button>
-                ),
-              )}
-            </div>
-            <div className="controls">
+
+          <div className="operation-tabs">
+            {operations.map(({ value, label, description, icon: Icon }) => (
+              <button
+                key={value}
+                type="button"
+                className={operation === value ? "selected" : ""}
+                onClick={() => setOperation(value)}
+                aria-pressed={operation === value}
+                disabled={isProcessing}
+              >
+                <span className="operation-icon">
+                  <Icon size={18} />
+                </span>
+                <span>
+                  <strong>{label}</strong>
+                  <small>{description}</small>
+                </span>
+                {operation === value && <Check className="selected-check" size={16} />}
+              </button>
+            ))}
+          </div>
+
+          <div className="settings-row">
+            <div className="settings">
               {(operation === "convert" || operation === "compress") && (
                 <label>
                   Output format
-                  <div className="select-wrap">
+                  <span className="select-wrap">
                     <select
                       value={format}
-                      onChange={(e) =>
-                        setFormat(e.target.value as OutputFormat)
+                      onChange={(event) =>
+                        setFormat(event.target.value as OutputFormat)
                       }
+                      disabled={isProcessing}
                     >
-                      <option value="png">PNG · Lossless</option>
-                      <option value="jpeg">JPG · Universal</option>
                       <option value="webp">WebP · Recommended</option>
+                      <option value="jpeg">JPG · Universal</option>
+                      <option value="png">PNG · Lossless</option>
                       <option value="avif">AVIF · Smallest</option>
                     </select>
                     <ChevronDown size={16} />
-                  </div>
+                  </span>
                 </label>
               )}
+
+              {operation === "remove-background" && (
+                <div className="background-output-note">
+                  <strong>Lossless full-resolution PNG</strong>
+                  <span>Refined edges · processed privately on this device</span>
+                </div>
+              )}
+
               {operation === "resize" && (
                 <>
                   <label>
-                    Width (px)
-                    <input
-                      type="number"
-                      placeholder="Auto"
-                      {...register("width")}
-                    />
+                    Width
+                    <span className="input-wrap">
+                      <input
+                        type="number"
+                        min="1"
+                        placeholder="Auto"
+                        value={width ?? ""}
+                        onChange={(event) => {
+                          setWidth(
+                            event.target.value
+                              ? Number(event.target.value)
+                              : undefined,
+                          );
+                          setPercentage(undefined);
+                        }}
+                        disabled={isProcessing}
+                      />
+                      <span>px</span>
+                    </span>
                   </label>
                   <label>
-                    Height (px)
-                    <input
-                      type="number"
-                      placeholder="Auto"
-                      {...register("height")}
-                    />
+                    Height
+                    <span className="input-wrap">
+                      <input
+                        type="number"
+                        min="1"
+                        placeholder="Auto"
+                        value={height ?? ""}
+                        onChange={(event) => {
+                          setHeight(
+                            event.target.value
+                              ? Number(event.target.value)
+                              : undefined,
+                          );
+                          setPercentage(undefined);
+                        }}
+                        disabled={isProcessing}
+                      />
+                      <span>px</span>
+                    </span>
                   </label>
                   <label>
                     Scale
-                    <div className="select-wrap">
-                      <select {...register("percentage")}>
+                    <span className="select-wrap short">
+                      <select
+                        value={percentage ?? ""}
+                        onChange={(event) => {
+                          const value = event.target.value
+                            ? Number(event.target.value)
+                            : undefined;
+                          setPercentage(value);
+                          if (value) {
+                            setWidth(undefined);
+                            setHeight(undefined);
+                          }
+                        }}
+                        disabled={isProcessing}
+                      >
+                        <option value="">Custom</option>
                         <option value="100">100%</option>
                         <option value="75">75%</option>
                         <option value="50">50%</option>
                         <option value="25">25%</option>
                       </select>
                       <ChevronDown size={16} />
-                    </div>
+                    </span>
                   </label>
+                  <Toggle
+                    checked={keepAspect}
+                    onChange={setKeepAspect}
+                    label="Keep aspect ratio"
+                  />
                 </>
               )}
-              {(operation === "resize" || operation === "compress") && (
-                <Toggle
-                  checked={keepAspect}
-                  onChange={setKeepAspect}
-                  label="Keep aspect ratio"
-                />
-              )}
+
               {operation === "compress" && format !== "png" && (
-                <label className="quality">
-                  Quality <span>{quality}%</span>
+                <label className="quality-control">
+                  <span>
+                    Quality <strong>{quality}%</strong>
+                  </span>
                   <input
                     type="range"
-                    min="1"
+                    min="20"
                     max="100"
-                    {...register("quality")}
+                    value={quality}
+                    onChange={(event) => setQuality(Number(event.target.value))}
+                    disabled={isProcessing}
                   />
-                  <div className="range-label">
-                    <span>Smaller file</span>
-                    <span>Higher quality</span>
-                  </div>
                 </label>
               )}
-              <Button
-                className="process-btn"
-                onClick={run}
-                disabled={isProcessing}
-              >
-                <Play size={16} fill="currentColor" />
-                {isProcessing ? "Processing..." : "Process images"}
-                <span className="enter-key">
-                  <CornerDownLeft size={13} />
-                </span>
-              </Button>
             </div>
-          </section>
-          <AnimatePresence>
-            {items.length > 0 && (
-              <motion.section
-                initial={{ opacity: 0, y: 8 }}
-                animate={{ opacity: 1, y: 0 }}
-                className="panel queue"
-              >
-                <div className="panel-head">
-                  <div>
-                    <h3>
-                      Image queue{" "}
-                      <span className="number-pill">{items.length}</span>
-                    </h3>
-                    <p>Ready to be processed.</p>
-                  </div>
-                  <button className="text-button" onClick={clear}>
-                    <Trash2 size={14} /> Clear all
-                  </button>
-                </div>
-                <div className="queue-list">
-                  {items.slice(0, 5).map((item) => (
-                    <div className="queue-item" key={item.id}>
-                      <img src={item.preview} />
-                      <div>
-                        <strong>{item.file.name}</strong>
-                        <small>{formatBytes(item.file.size)}</small>
-                      </div>
-                      <button onClick={() => remove(item.id)}>
-                        <Trash2 size={15} />
-                      </button>
-                    </div>
-                  ))}
-                  {items.length > 5 && (
-                    <span className="more-files">
-                      + {items.length - 5} more images
-                    </span>
-                  )}
-                </div>
-              </motion.section>
-            )}
-          </AnimatePresence>
-          <AnimatePresence>
-            {results.length > 0 && (
-              <motion.section
-                initial={{ opacity: 0, y: 8 }}
-                animate={{ opacity: 1, y: 0 }}
-                className="panel results"
-              >
-                <div className="panel-head">
-                  <div>
-                    <h3>
-                      Results{" "}
-                      <span className="number-pill success">
-                        {results.length}
-                      </span>
-                    </h3>
-                    <p>
-                      {savings > 0
-                        ? `${formatBytes(savings)} saved across this batch.`
-                        : "Your processed images are ready."}
-                    </p>
-                  </div>
-                  <div className="results-actions">
-                    <Button variant="secondary" onClick={clear}>
-                      <Trash2 size={16} /> Clear all
-                    </Button>
-                    <Button variant="secondary" onClick={downloadFiles}>
-                      <Download size={16} /> Download files
-                    </Button>
-                    <Button onClick={downloadZip}>
-                      <ArrowDownToLine size={16} /> Download ZIP
-                    </Button>
-                  </div>
-                </div>
-                <div className="result-grid">
-                  {results.slice(0, 6).map((item) => (
-                    <div className="result-card" key={item.id}>
-                      <img src={item.preview} />
-                      <div>
-                        <strong>{item.name}</strong>
-                        <small>
-                          {item.width && item.height
-                            ? `${item.width} × ${item.height} · `
-                            : ""}
-                          {formatBytes(item.outputSize)} <span>·</span>{" "}
-                          <em title={item.warning}>
-                            {item.warning
-                              ? "preview quality"
-                              : item.bitDepth
-                                ? `${item.bitDepth}-bit`
-                              : item.outputSize < item.originalSize
-                                ? `-${Math.round((1 - item.outputSize / item.originalSize) * 100)}%`
-                                : "ready"}
-                          </em>
-                        </small>
-                        <button
-                          className="text-button download-file"
-                          onClick={() => downloadFile(item)}
-                        >
-                          <Download size={13} /> Download file
-                        </button>
-                      </div>
-                      <Check className="result-check" size={15} />
-                    </div>
-                  ))}
-                </div>
-              </motion.section>
-            )}
-          </AnimatePresence>
+
+            <Button
+              className="process-button"
+              onClick={run}
+              disabled={isProcessing}
+            >
+              <Play size={17} fill="currentColor" />
+              {isProcessing ? "Processing…" : actionLabel}
+            </Button>
+          </div>
         </section>
+
+        <AnimatePresence>
+          {items.length > 0 && (
+            <motion.section
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="queue-card"
+            >
+              <div className="card-heading">
+                <div>
+                  <h2>
+                    Image queue <span>{items.length}</span>
+                  </h2>
+                  <p>
+                    {isProcessing
+                      ? "Processing this queue."
+                      : "Ready to be processed."}
+                  </p>
+                </div>
+                {isProcessing && batchProgress && (
+                  <div className="batch-progress" aria-live="polite">
+                    <div className="progress-copy">
+                      <div>
+                        <strong>{batchProgress.stage}</strong>
+                        <span title={batchProgress.filename}>
+                          {batchProgress.filename}
+                        </span>
+                      </div>
+                      <div>
+                        <strong>{batchProgress.percent}%</strong>
+                        <span>
+                          {batchProgress.current} of {batchProgress.total}
+                          {batchProgress.secondsRemaining !== undefined &&
+                          batchProgress.secondsRemaining > 0
+                            ? ` · about ${batchProgress.secondsRemaining < 60
+                              ? `${batchProgress.secondsRemaining}s`
+                              : `${Math.ceil(batchProgress.secondsRemaining / 60)} min`} left`
+                            : ""}
+                        </span>
+                      </div>
+                    </div>
+                    <div
+                      className="progress-track"
+                      role="progressbar"
+                      aria-label={`Processing ${batchProgress.filename}`}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={batchProgress.percent}
+                    >
+                      <span style={{ width:`${batchProgress.percent}%` }} />
+                    </div>
+                  </div>
+                )}
+                <button
+                  type="button"
+                  onClick={clear}
+                  className="text-button"
+                  disabled={isProcessing}
+                >
+                  <Trash2 size={15} /> Clear all
+                </button>
+              </div>
+              <div className="queue-list">
+                {items.map((item) => (
+                  <article key={item.id}>
+                    <img src={item.preview} alt="" />
+                    <div>
+                      <strong>{item.file.name}</strong>
+                      <small>{formatBytes(item.file.size)}</small>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => remove(item.id)}
+                      aria-label={`Remove ${item.file.name}`}
+                      disabled={isProcessing}
+                    >
+                      <X size={16} />
+                    </button>
+                  </article>
+                ))}
+              </div>
+            </motion.section>
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {results.length > 0 && !isProcessing && (
+            <motion.section
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="results-card"
+            >
+              <div className="card-heading">
+                <div>
+                  <h2>
+                    Images ready <span className="success">{results.length}</span>
+                  </h2>
+                  <p>
+                    {savings
+                      ? `${formatBytes(savings)} saved across this batch.`
+                      : "Your processed files are ready."}
+                  </p>
+                </div>
+                <div className="result-actions">
+                  <Button variant="secondary" onClick={clear}>
+                    Clear
+                  </Button>
+                  <Button variant="secondary" onClick={downloadAllFiles}>
+                    <ArrowDownToLine size={17} /> Download all
+                  </Button>
+                  <Button onClick={downloadZip}>
+                    <Archive size={17} /> Download as ZIP
+                  </Button>
+                </div>
+              </div>
+              <div className="result-list">
+                {results.map((item) => (
+                  <article key={item.id}>
+                    <img src={item.preview} alt="" />
+                    <div>
+                      <strong>{item.name}</strong>
+                      <small>
+                        {item.width && item.height
+                          ? `${item.width} × ${item.height} · `
+                          : ""}
+                        {formatBytes(item.outputSize)}
+                      </small>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => downloadFile(item)}
+                      aria-label={`Download ${item.name}`}
+                    >
+                      <Download size={16} />
+                    </button>
+                  </article>
+                ))}
+              </div>
+            </motion.section>
+          )}
+        </AnimatePresence>
       </main>
+
       <AnimatePresence>
         {notice && (
           <motion.div
-            initial={{ opacity: 0, y: 20 }}
+            initial={{ opacity: 0, y: 15 }}
             animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 20 }}
+            exit={{ opacity: 0, y: 15 }}
             className="toast"
+            role="status"
           >
             <Check size={16} />
-            {notice}
-            <button onClick={() => setNotice("")}>
+            <span>{notice}</span>
+            <button
+              type="button"
+              onClick={() => setNotice("")}
+              aria-label="Dismiss message"
+            >
               <X size={15} />
             </button>
           </motion.div>
