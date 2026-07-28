@@ -311,7 +311,6 @@ export default function App() {
       <main>
         <section className="hero">
           <div>
-            <h1>Move faster with every image.</h1>
             <p>Convert, resize, and compress your image library in one focused workspace.</p>
           </div>
           <Button
