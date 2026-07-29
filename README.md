@@ -47,8 +47,15 @@ Background removal uses a bundled, MIT-licensed 512×512 BiRefNet-lite browser
 export through Transformers.js. The half-precision model stays loaded in a
 dedicated worker across a batch, uses local WebAssembly inference for broad
 device compatibility, and never uploads the source image. A subject-aware
-second pass refines the matte before it is applied directly to the original
-decoded pixels and exported as a full-resolution, lossless PNG.
+multi-pass stage gives each person more model resolution and adds dedicated
+head-and-upper-body passes for fine hair and narrow background gaps enclosed by
+raised arms. Overlap consensus clears background visible between adjacent
+people, while guarded ownership bands protect neighboring bodies from an
+uncertain crop. Small model-confirmed background pockets receive a guarded
+inward expansion so interpolation cannot restore their rims as foreground. An
+RGB-guided full-resolution filter then snaps the matte to source-image edges
+and cleans color spill while the edge is still soft, before exporting a
+lossless transparent PNG.
 
 Premium readiness is intentionally represented at the workflow boundary: each future operation can be modeled as a typed operation and checked before `processImage` is called. Payments and account state are not included in the MVP.
 

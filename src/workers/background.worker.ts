@@ -15,14 +15,92 @@ type WorkerRequest = {
 const workerScope = self as unknown as DedicatedWorkerGlobalScope
 const MODEL_ID = 'studioludens/birefnet-lite-512'
 const MAX_INFERENCE_EDGE = 512
-const MASK_THRESHOLD = 32
-const REFINEMENT_PADDING = 0.1
+const COMPONENT_THRESHOLD = 24
+const REFINEMENT_PADDING = 0.14
+const MAX_REFINEMENT_PASSES = 4
+const MAX_PERSON_REFINEMENT_PASSES = 8
+const MIN_COMPONENT_FRACTION = 0.001
+const HEAD_THRESHOLD = 100
+const HEAD_ZONE_FRACTIONS = [0.1, 0.12, 0.15] as const
+const MIN_HEAD_AREA_FRACTION = 0.0009
+const PERSON_CROP_CONTEXT = 0.8
+const PERSON_CROP_MIN_ASPECT = 0.75
+const PERSON_OWNERSHIP_FEATHER = 0.12
+const HEAD_CROP_WIDTH_SCALE = 2.8
+const HEAD_CROP_HEIGHT_SCALE = 3.8
+const HEAD_CROP_TOP_PADDING = 0.55
+const HAIR_DETAIL_ZONE_FRACTION = 0.72
+const HAIR_ALPHA_CURVE_POWER = 2.2
+const STANDARD_ALPHA_CURVE_POWER = 4
+const CONSENSUS_CROP_MARGIN = 0.04
+const CONSENSUS_BACKGROUND_THRESHOLD = 56
+const CONSENSUS_FOREGROUND_THRESHOLD = 210
+const CONSENSUS_BACKGROUND_VOTES = 2
+const CONSENSUS_FOREGROUND_FLAG = 0x80
+const CONSENSUS_BACKGROUND_MASK = 0x7f
+const POCKET_BACKGROUND_THRESHOLD = 32
+const POCKET_MIN_AREA = 48
+const POCKET_MAX_AREA_FRACTION = 0.015
+const POCKET_EXPANSION_RADIUS = 6
+const POCKET_FEATHER_RADIUS = 3
+const COLOR_BUCKET_BITS = 4
+const COLOR_BUCKET_COUNT = 1 << (COLOR_BUCKET_BITS * 3)
+const COLOR_ISLAND_BACKGROUND_ALPHA = 24
+const COLOR_ISLAND_FOREGROUND_ALPHA = 232
+const COLOR_ISLAND_SEED_ALPHA = 224
+const COLOR_ISLAND_BACKGROUND_RATIO = 0.97
+const COLOR_ISLAND_GROWTH_RATIO = 0.5
+const COLOR_ISLAND_MIN_AREA_FRACTION = 0.00004
+const COLOR_ISLAND_MIN_SATELLITE_AREA = 12
+const COLOR_ISLAND_SATELLITE_DISTANCE = 24
+const COLOR_ISLAND_MAX_AREA_FRACTION = 0.004
+const COLOR_ISLAND_CLEARANCE_SCALE = 1.2
+const COLOR_ISLAND_MAX_CLEARANCE_FRACTION = 0.08
+const COLOR_ISLAND_GROWTH_PADDING = 12
+const COLOR_ISLAND_EXPANSION_RADIUS = 0
+const COLOR_ISLAND_FEATHER_RADIUS = 2
+const ALPHA_FILTER_RADIUS = 2
+const ALPHA_FILTER_PASSES = 2
+const MAX_COLOR_EDGE_RADIUS = 24
+const DETACHED_ARTIFACT_THRESHOLD = 128
+const DETACHED_ARTIFACT_MAX_PRIMARY_FRACTION = 0.012
+const DETACHED_ARTIFACT_LOWER_FRACTION = 0.48
+const DETACHED_ARTIFACT_MAP_EDGE = 512
+const DETACHED_ARTIFACT_PADDING = 1
+const COLOR_EDGE_DIRECTIONS = [
+  [-1, 0],
+  [1, 0],
+  [0, -1],
+  [0, 1],
+  [-1, -1],
+  [1, -1],
+  [-1, 1],
+  [1, 1],
+] as const
 
 type SourceRect = {
   left: number
   top: number
   width: number
   height: number
+}
+
+type MaskLayer = {
+  mask: RawImage
+  source: SourceRect
+  detail?: 'person' | 'hair'
+  ownership?: {
+    left: number
+    right: number
+  }
+}
+
+type MaskComponent = {
+  minX: number
+  minY: number
+  maxX: number
+  maxY: number
+  area: number
 }
 
 env.allowRemoteModels = false
@@ -106,73 +184,541 @@ async function inferMask(
   if (!output) {
     throw new Error('The background-removal model returned no mask.')
   }
-  return RawImage
-    .fromTensor(output[0].sigmoid().mul(255).to('uint8'))
-    .resize(canvas.width, canvas.height)
+  return RawImage.fromTensor(output[0].sigmoid().mul(255).to('uint8'))
 }
 
-function findRefinementRect(
+function findMaskComponents(
   mask: RawImage,
-  imageWidth: number,
-  imageHeight: number,
-): SourceRect | undefined {
-  let minX = mask.width
-  let minY = mask.height
-  let maxX = -1
-  let maxY = -1
+  threshold: number,
+  maximumY = mask.height - 1,
+): MaskComponent[] {
+  const pixelCount = mask.width * mask.height
+  const visited = new Uint8Array(pixelCount)
+  const queue = new Int32Array(pixelCount)
+  const components: MaskComponent[] = []
 
-  for (let y = 0; y < mask.height; y += 1) {
-    for (let x = 0; x < mask.width; x += 1) {
-      if (mask.data[y * mask.width + x] < MASK_THRESHOLD) continue
+  for (let start = 0; start < pixelCount; start += 1) {
+    const startY = Math.floor(start / mask.width)
+    if (
+      startY > maximumY
+      || visited[start]
+      || mask.data[start] < threshold
+    ) continue
+
+    let read = 0
+    let write = 0
+    let area = 0
+    let minX = mask.width
+    let minY = mask.height
+    let maxX = -1
+    let maxY = -1
+    queue[write++] = start
+    visited[start] = 1
+
+    while (read < write) {
+      const index = queue[read++]
+      const x = index % mask.width
+      const y = Math.floor(index / mask.width)
+      area += 1
       minX = Math.min(minX, x)
       minY = Math.min(minY, y)
       maxX = Math.max(maxX, x)
       maxY = Math.max(maxY, y)
+
+      const xStart = Math.max(0, x - 1)
+      const xEnd = Math.min(mask.width - 1, x + 1)
+      const yStart = Math.max(0, y - 1)
+      const yEnd = Math.min(maximumY, y + 1)
+      for (let neighborY = yStart; neighborY <= yEnd; neighborY += 1) {
+        const row = neighborY * mask.width
+        for (let neighborX = xStart; neighborX <= xEnd; neighborX += 1) {
+          const neighbor = row + neighborX
+          if (
+            visited[neighbor]
+            || mask.data[neighbor] < threshold
+          ) continue
+          visited[neighbor] = 1
+          queue[write++] = neighbor
+        }
+      }
+    }
+
+    components.push({ minX, minY, maxX, maxY, area })
+  }
+
+  return components
+}
+
+function removeDetachedFullResolutionArtifacts(
+  alpha: Uint8ClampedArray,
+  width: number,
+  height: number,
+) {
+  const scale = Math.min(
+    1,
+    DETACHED_ARTIFACT_MAP_EDGE / Math.max(width, height),
+  )
+  const mapWidth = Math.max(1, Math.round(width * scale))
+  const mapHeight = Math.max(1, Math.round(height * scale))
+  const mappedAlpha = new Uint8ClampedArray(mapWidth * mapHeight)
+  const xMap = new Int32Array(width)
+  for (let x = 0; x < width; x += 1) {
+    xMap[x] = Math.min(
+      mapWidth - 1,
+      Math.floor(x / width * mapWidth),
+    )
+  }
+  for (let y = 0; y < height; y += 1) {
+    const mappedY = Math.min(
+      mapHeight - 1,
+      Math.floor(y / height * mapHeight),
+    )
+    const sourceRow = y * width
+    const targetRow = mappedY * mapWidth
+    for (let x = 0; x < width; x += 1) {
+      const target = targetRow + xMap[x]
+      mappedAlpha[target] = Math.max(
+        mappedAlpha[target],
+        alpha[sourceRow + x],
+      )
     }
   }
-  if (maxX < minX || maxY < minY) return
 
-  let left = Math.floor(minX / mask.width * imageWidth)
-  let top = Math.floor(minY / mask.height * imageHeight)
-  let right = Math.ceil((maxX + 1) / mask.width * imageWidth)
-  let bottom = Math.ceil((maxY + 1) / mask.height * imageHeight)
-  const padding = Math.round(
-    Math.max(right - left, bottom - top) * REFINEMENT_PADDING,
+  const mask = new RawImage(
+    mappedAlpha,
+    mapWidth,
+    mapHeight,
+    1,
   )
-  left = Math.max(0, left - padding)
-  top = Math.max(0, top - padding)
-  right = Math.min(imageWidth, right + padding)
-  bottom = Math.min(imageHeight, bottom + padding)
+  const components = findMaskComponents(
+    mask,
+    DETACHED_ARTIFACT_THRESHOLD,
+  ).sort((a, b) => b.area - a.area)
+  const primary = components[0]
+  if (!primary) return
 
-  const width = right - left
-  const height = bottom - top
-  const resolutionGain = Math.max(imageWidth, imageHeight)
-    / Math.max(width, height)
-  if (width < 2 || height < 2 || resolutionGain < 1.2) return
-  return { left, top, width, height }
+  const primaryHeight = primary.maxY - primary.minY + 1
+  const lowerBoundary = (
+    primary.minY + primaryHeight * DETACHED_ARTIFACT_LOWER_FRACTION
+  )
+  const maximumArea = Math.max(
+    8,
+    Math.round(
+      primary.area * DETACHED_ARTIFACT_MAX_PRIMARY_FRACTION,
+    ),
+  )
+
+  for (const component of components.slice(1)) {
+    const isLowerArtifact = component.minY >= lowerBoundary
+    const isOutsidePrimary = (
+      component.maxX < primary.minX
+      || component.minX > primary.maxX
+    )
+    if (
+      !isLowerArtifact
+      || !isOutsidePrimary
+      || component.area > maximumArea
+    ) continue
+
+    const mappedLeft = Math.max(
+      0,
+      component.minX - DETACHED_ARTIFACT_PADDING,
+    )
+    const mappedTop = Math.max(
+      0,
+      component.minY - DETACHED_ARTIFACT_PADDING,
+    )
+    const mappedRight = Math.min(
+      mask.width - 1,
+      component.maxX + DETACHED_ARTIFACT_PADDING,
+    )
+    const mappedBottom = Math.min(
+      mask.height - 1,
+      component.maxY + DETACHED_ARTIFACT_PADDING,
+    )
+    const left = Math.floor(mappedLeft / mapWidth * width)
+    const top = Math.floor(mappedTop / mapHeight * height)
+    const right = Math.min(
+      width - 1,
+      Math.ceil((mappedRight + 1) / mapWidth * width),
+    )
+    const bottom = Math.min(
+      height - 1,
+      Math.ceil((mappedBottom + 1) / mapHeight * height),
+    )
+    for (let y = top; y <= bottom; y += 1) {
+      const row = y * width
+      for (let x = left; x <= right; x += 1) {
+        alpha[row + x] = 0
+      }
+    }
+  }
 }
 
-function sharpenAlpha(value: number) {
-  const normalized = value / 255
-  const contrasted = Math.max(0, Math.min(1, (normalized - 0.18) / 0.66))
-  return Math.round(
-    contrasted * contrasted * (3 - 2 * contrasted) * 255,
+function expandEnclosedBackgroundPockets(mask: RawImage) {
+  const pixelCount = mask.width * mask.height
+  const maximumArea = Math.round(
+    pixelCount * POCKET_MAX_AREA_FRACTION,
   )
-}
+  const visited = new Uint8Array(pixelCount)
+  const queue = new Int32Array(pixelCount)
+  const expanded = mask.clone()
+  const outerRadius = (
+    POCKET_EXPANSION_RADIUS + POCKET_FEATHER_RADIUS
+  )
 
-function applyFullResolutionAlpha(
-  context: OffscreenCanvasRenderingContext2D,
-  imageWidth: number,
-  imageHeight: number,
-  mask: RawImage,
-  source: SourceRect,
-) {
-  const pixels = context.getImageData(0, 0, imageWidth, imageHeight)
-  const data = pixels.data
-  for (let offset = 3; offset < data.length; offset += 4) {
-    data[offset] = 0
+  for (let start = 0; start < pixelCount; start += 1) {
+    if (
+      visited[start]
+      || mask.data[start] > POCKET_BACKGROUND_THRESHOLD
+    ) continue
+
+    let read = 0
+    let write = 0
+    let touchesBorder = false
+    queue[write++] = start
+    visited[start] = 1
+
+    while (read < write) {
+      const index = queue[read++]
+      const x = index % mask.width
+      const y = Math.floor(index / mask.width)
+      if (
+        x === 0
+        || y === 0
+        || x === mask.width - 1
+        || y === mask.height - 1
+      ) touchesBorder = true
+
+      const xStart = Math.max(0, x - 1)
+      const xEnd = Math.min(mask.width - 1, x + 1)
+      const yStart = Math.max(0, y - 1)
+      const yEnd = Math.min(mask.height - 1, y + 1)
+      for (let neighborY = yStart; neighborY <= yEnd; neighborY += 1) {
+        const row = neighborY * mask.width
+        for (let neighborX = xStart; neighborX <= xEnd; neighborX += 1) {
+          const neighbor = row + neighborX
+          if (
+            visited[neighbor]
+            || mask.data[neighbor] > POCKET_BACKGROUND_THRESHOLD
+          ) continue
+          visited[neighbor] = 1
+          queue[write++] = neighbor
+        }
+      }
+    }
+
+    if (
+      touchesBorder
+      || write < POCKET_MIN_AREA
+      || write > maximumArea
+    ) continue
+
+    // The model has found a small, fully enclosed background opening, but
+    // interpolation can restore its uncertain rim as opaque foreground.
+    // Expand only this confirmed pocket; large/exterior background regions
+    // and tiny facial details are deliberately excluded.
+    for (let componentIndex = 0; componentIndex < write; componentIndex += 1) {
+      const seed = queue[componentIndex]
+      const seedX = seed % mask.width
+      const seedY = Math.floor(seed / mask.width)
+      for (let dy = -outerRadius; dy <= outerRadius; dy += 1) {
+        const targetY = seedY + dy
+        if (targetY < 0 || targetY >= mask.height) continue
+        for (let dx = -outerRadius; dx <= outerRadius; dx += 1) {
+          const targetX = seedX + dx
+          if (targetX < 0 || targetX >= mask.width) continue
+          const distance = Math.sqrt(dx * dx + dy * dy)
+          if (distance > outerRadius) continue
+          const alphaCap = distance <= POCKET_EXPANSION_RADIUS
+            ? 0
+            : Math.round(
+                (distance - POCKET_EXPANSION_RADIUS)
+                / POCKET_FEATHER_RADIUS
+                * 255,
+              )
+          const target = targetY * mask.width + targetX
+          expanded.data[target] = Math.min(
+            expanded.data[target],
+            alphaCap,
+          )
+        }
+      }
+    }
   }
 
+  return expanded
+}
+
+function findRefinementRects(
+  mask: RawImage,
+  imageWidth: number,
+  imageHeight: number,
+): SourceRect[] {
+  const pixelCount = mask.width * mask.height
+  const components = findMaskComponents(mask, COMPONENT_THRESHOLD)
+  const minimumArea = Math.max(32, Math.round(pixelCount * MIN_COMPONENT_FRACTION))
+  return components
+    .filter(component => component.area >= minimumArea)
+    .sort((a, b) => b.area - a.area)
+    .slice(0, MAX_REFINEMENT_PASSES)
+    .map(component => {
+      let left = Math.floor(component.minX / mask.width * imageWidth)
+      let top = Math.floor(component.minY / mask.height * imageHeight)
+      let right = Math.ceil((component.maxX + 1) / mask.width * imageWidth)
+      let bottom = Math.ceil((component.maxY + 1) / mask.height * imageHeight)
+      const padding = Math.round(
+        Math.max(right - left, bottom - top) * REFINEMENT_PADDING,
+      )
+      left = Math.max(0, left - padding)
+      top = Math.max(0, top - padding)
+      right = Math.min(imageWidth, right + padding)
+      bottom = Math.min(imageHeight, bottom + padding)
+      return {
+        left,
+        top,
+        width:right - left,
+        height:bottom - top,
+      }
+    })
+    .filter(rect => {
+      const resolutionGain = Math.max(imageWidth, imageHeight)
+        / Math.max(rect.width, rect.height)
+      return rect.width >= 2 && rect.height >= 2 && resolutionGain >= 1.15
+    })
+}
+
+function findPersonRefinementLayers(
+  mask: RawImage,
+  imageWidth: number,
+  imageHeight: number,
+): Array<Pick<
+  MaskLayer,
+  'source' | 'detail' | 'ownership'
+>> {
+  const pixelCount = mask.width * mask.height
+  const minimumArea = Math.max(
+    32,
+    Math.round(pixelCount * MIN_COMPONENT_FRACTION),
+  )
+  const foreground = findMaskComponents(mask, COMPONENT_THRESHOLD)
+    .filter(component => component.area >= minimumArea)
+    .sort((a, b) => b.area - a.area)[0]
+  if (!foreground) return []
+
+  const foregroundHeight = foreground.maxY - foreground.minY + 1
+  const minimumHeadArea = Math.max(
+    40,
+    Math.round(pixelCount * MIN_HEAD_AREA_FRACTION),
+  )
+  const minimumSeparation = mask.width * 0.035
+  let heads: MaskComponent[] = []
+  for (const headZoneFraction of HEAD_ZONE_FRACTIONS) {
+    const headZoneBottom = Math.min(
+      mask.height - 1,
+      Math.round(
+        foreground.minY + foregroundHeight * headZoneFraction,
+      ),
+    )
+    const candidates = findMaskComponents(
+      mask,
+      HEAD_THRESHOLD,
+      headZoneBottom,
+    )
+      .filter(component => {
+        const width = component.maxX - component.minX + 1
+        const height = component.maxY - component.minY + 1
+        const fill = component.area / (width * height)
+        return (
+          component.area >= minimumHeadArea
+          && width >= mask.width * 0.015
+          && width <= mask.width * 0.16
+          && height >= width * 0.75
+          && fill >= 0.32
+        )
+      })
+      .sort((a, b) => b.area - a.area)
+      .slice(0, MAX_PERSON_REFINEMENT_PASSES)
+      .sort((a, b) => a.minX - b.minX)
+      // Keep one component per head when a small detached detail sits beside it.
+      .filter((head, index, components) => {
+        if (index === 0) return true
+        const center = (head.minX + head.maxX + 1) / 2
+        const previous = components[index - 1]
+        const previousCenter = (
+          previous.minX + previous.maxX + 1
+        ) / 2
+        return center - previousCenter >= minimumSeparation
+      })
+
+    // A tight zone keeps adjacent heads separate; the wider fallback retains
+    // enough height for photos where only the upper part of a head is visible.
+    if (candidates.length >= heads.length) heads = candidates
+  }
+  if (heads.length === 0) return []
+
+  const centers = heads.map(head => (head.minX + head.maxX + 1) / 2)
+  const bandEdges = [
+    foreground.minX,
+    ...centers.slice(0, -1).map(
+      (center, index) => (center + centers[index + 1]) / 2,
+    ),
+    foreground.maxX + 1,
+  ]
+  const sortedHeadWidths = heads
+    .map(head => head.maxX - head.minX + 1)
+    .sort((a, b) => a - b)
+  const medianHeadWidth = sortedHeadWidths[
+    Math.floor(sortedHeadWidths.length / 2)
+  ]
+  const headWidth = medianHeadWidth / mask.width * imageWidth
+  const headTop = Math.min(...heads.map(head => head.minY))
+  const cropTop = Math.max(
+    0,
+    Math.floor(
+      (headTop - medianHeadWidth * 0.55) / mask.height * imageHeight,
+    ),
+  )
+  const cropBottom = Math.min(
+    imageHeight,
+    Math.ceil((foreground.maxY + 1) / mask.height * imageHeight)
+      + Math.round(medianHeadWidth * 0.18 / mask.height * imageHeight),
+  )
+
+  const personLayers = heads.map((_head, index) => {
+    const bandLeft = bandEdges[index]
+    const bandRight = bandEdges[index + 1]
+    const bandWidth = bandRight - bandLeft
+    const ownership = {
+      left:Math.floor(bandLeft / mask.width * imageWidth),
+      right:Math.ceil(bandRight / mask.width * imageWidth),
+    }
+    let left: number
+    let right: number
+    const context = bandWidth * PERSON_CROP_CONTEXT
+    left = Math.max(
+      0,
+      Math.floor((bandLeft - context) / mask.width * imageWidth),
+    )
+    right = Math.min(
+      imageWidth,
+      Math.ceil((bandRight + context) / mask.width * imageWidth),
+    )
+    const minimumCropWidth = Math.min(
+      imageWidth,
+      Math.ceil(
+        (cropBottom - cropTop) * PERSON_CROP_MIN_ASPECT,
+      ),
+    )
+    const headCenter = (
+      (heads[index].minX + heads[index].maxX + 1)
+      / 2 / mask.width * imageWidth
+    )
+    if (right - left < minimumCropWidth) {
+      left = Math.max(
+        0,
+        Math.min(
+          imageWidth - minimumCropWidth,
+          Math.floor(headCenter - minimumCropWidth / 2),
+        ),
+      )
+      right = left + minimumCropWidth
+    }
+    return {
+      source:{
+        left,
+        top:cropTop,
+        width:right - left,
+        height:cropBottom - cropTop,
+      },
+      detail:'person' as const,
+      ownership,
+    }
+  }).filter(layer => layer.source.width >= 2 && layer.source.height >= 2)
+
+  // A full-body crop still allocates only a small part of the model input to
+  // the head and narrow gaps around bent arms. A tighter portrait/upper-body
+  // pass gives both regions more pixels, while the ownership band protects
+  // neighboring people.
+  const headCropWidth = headWidth * HEAD_CROP_WIDTH_SCALE
+  const headCropHeight = headWidth * HEAD_CROP_HEIGHT_SCALE
+  const headLayers = heads.map((head, index) => {
+    const centerX = (
+      (head.minX + head.maxX + 1) / 2 / mask.width * imageWidth
+    )
+    const headTop = head.minY / mask.height * imageHeight
+    const left = Math.max(0, Math.floor(centerX - headCropWidth / 2))
+    const top = Math.max(
+      0,
+      Math.floor(headTop - headWidth * HEAD_CROP_TOP_PADDING),
+    )
+    const right = Math.min(
+      imageWidth,
+      Math.ceil(centerX + headCropWidth / 2),
+    )
+    const bottom = Math.min(
+      imageHeight,
+      Math.ceil(top + headCropHeight),
+    )
+    return {
+      source:{
+        left,
+        top,
+        width:right - left,
+        height:bottom - top,
+      },
+      detail:'hair' as const,
+      ownership:personLayers[index].ownership,
+    }
+  }).filter(layer => layer.source.width >= 2 && layer.source.height >= 2)
+
+  return [...personLayers, ...headLayers]
+}
+
+function polishAlpha(value: number, preserveFineDetail = false) {
+  const normalized = value / 255
+  const transparentLimit = preserveFineDetail ? 0.003 : 0.015
+  const opaqueLimit = preserveFineDetail ? 0.997 : 0.985
+  if (normalized <= transparentLimit) return 0
+  if (normalized >= opaqueLimit) return 255
+
+  // A strong odds curve keeps ordinary contours crisp. Hair uses a gentler
+  // curve so low-opacity strand predictions survive the final matte polish.
+  const power = preserveFineDetail
+    ? HAIR_ALPHA_CURVE_POWER
+    : STANDARD_ALPHA_CURVE_POWER
+  const foreground = normalized ** power
+  const background = (1 - normalized) ** power
+  return Math.round(foreground / (foreground + background) * 255)
+}
+
+function rasterizeMask(
+  alpha: Uint8ClampedArray,
+  imageWidth: number,
+  layer: MaskLayer,
+  blendAtBorder: boolean,
+  consensusEvidence?: Uint8Array,
+  lowestBackground?: Uint8ClampedArray,
+) {
+  const { mask, source, ownership } = layer
+  const consensusMargin = Math.max(
+    2,
+    Math.round(
+      Math.min(source.width, source.height) * CONSENSUS_CROP_MARGIN,
+    ),
+  )
+  const ownershipFeather = ownership
+    ? Math.max(
+        2,
+        Math.round(
+          (ownership.right - ownership.left) * PERSON_OWNERSHIP_FEATHER,
+        ),
+      )
+    : 0
+  const verticalFeather = Math.max(
+    2,
+    Math.round(source.height * 0.035),
+  )
   const x0 = new Int32Array(source.width)
   const x1 = new Int32Array(source.width)
   const xWeight = new Float32Array(source.width)
@@ -199,9 +745,703 @@ function applyFullResolutionAlpha(
         + mask.data[lowerRow + x1[x]] * horizontalWeight
       const bottom = mask.data[upperRow + x0[x]] * (1 - horizontalWeight)
         + mask.data[upperRow + x1[x]] * horizontalWeight
-      const alpha = top * (1 - yWeight) + bottom * yWeight
-      data[(outputRow + x) * 4 + 3] = sharpenAlpha(alpha)
+      const predicted = top * (1 - yWeight) + bottom * yWeight
+      const outputIndex = outputRow + x
+      if (
+        consensusEvidence
+        && lowestBackground
+      ) {
+        if (
+          x >= consensusMargin
+          && y >= consensusMargin
+          && x < source.width - consensusMargin
+          && y < source.height - consensusMargin
+        ) {
+          if (predicted <= CONSENSUS_BACKGROUND_THRESHOLD) {
+            const evidence = consensusEvidence[outputIndex]
+            const votes = evidence & CONSENSUS_BACKGROUND_MASK
+            consensusEvidence[outputIndex] = (
+              evidence & CONSENSUS_FOREGROUND_FLAG
+            ) | Math.min(CONSENSUS_BACKGROUND_MASK, votes + 1)
+            lowestBackground[outputIndex] = Math.min(
+              lowestBackground[outputIndex],
+              Math.round(predicted),
+            )
+          } else if (predicted >= CONSENSUS_FOREGROUND_THRESHOLD) {
+            consensusEvidence[outputIndex] |= CONSENSUS_FOREGROUND_FLAG
+          }
+        }
+      }
+
+      const outputX = source.left + x
+      if (
+        ownership
+        && (outputX < ownership.left || outputX >= ownership.right)
+      ) continue
+      if (!blendAtBorder) {
+        alpha[outputIndex] = predicted
+        continue
+      }
+
+      const blend = ownership
+        ? Math.max(0, Math.min(
+            1,
+            (outputX - ownership.left) / ownershipFeather,
+            (ownership.right - 1 - outputX) / ownershipFeather,
+            y / verticalFeather,
+            (source.height - 1 - y) / verticalFeather,
+          ))
+        : Math.max(0, Math.min(
+            1,
+            Math.min(
+              x,
+              y,
+              source.width - 1 - x,
+              source.height - 1 - y,
+            ) / Math.max(
+              2,
+              Math.round(Math.min(source.width, source.height) * 0.035),
+            ),
+          ))
+      const smoothBlend = blend * blend * (3 - 2 * blend)
+      alpha[outputIndex] = Math.round(
+        alpha[outputIndex] * (1 - smoothBlend) + predicted * smoothBlend,
+      )
     }
+  }
+}
+
+function edgeAwareFilter(
+  pixels: Uint8ClampedArray,
+  alpha: Uint8ClampedArray,
+  width: number,
+  height: number,
+) {
+  let input = alpha
+  let output = new Uint8ClampedArray(alpha.length)
+  const colorScale = 2 * 32 * 32
+  const spatialScale = 2 * 1.35 * 1.35
+
+  for (let pass = 0; pass < ALPHA_FILTER_PASSES; pass += 1) {
+    output.set(input)
+    for (let y = 0; y < height; y += 1) {
+      const yStart = Math.max(0, y - ALPHA_FILTER_RADIUS)
+      const yEnd = Math.min(height - 1, y + ALPHA_FILTER_RADIUS)
+      for (let x = 0; x < width; x += 1) {
+        const index = y * width + x
+        const centerAlpha = input[index]
+        if (centerAlpha <= 2 || centerAlpha >= 253) continue
+
+        const pixelOffset = index * 4
+        const red = pixels[pixelOffset]
+        const green = pixels[pixelOffset + 1]
+        const blue = pixels[pixelOffset + 2]
+        const xStart = Math.max(0, x - ALPHA_FILTER_RADIUS)
+        const xEnd = Math.min(width - 1, x + ALPHA_FILTER_RADIUS)
+        let weightedAlpha = 0
+        let weightTotal = 0
+
+        for (let neighborY = yStart; neighborY <= yEnd; neighborY += 1) {
+          const dy = neighborY - y
+          for (let neighborX = xStart; neighborX <= xEnd; neighborX += 1) {
+            const dx = neighborX - x
+            const neighborIndex = neighborY * width + neighborX
+            const neighborOffset = neighborIndex * 4
+            const redDelta = red - pixels[neighborOffset]
+            const greenDelta = green - pixels[neighborOffset + 1]
+            const blueDelta = blue - pixels[neighborOffset + 2]
+            const colorDistance = (
+              redDelta * redDelta
+              + greenDelta * greenDelta
+              + blueDelta * blueDelta
+            )
+            const spatialDistance = dx * dx + dy * dy
+            const weight = Math.exp(
+              -colorDistance / colorScale - spatialDistance / spatialScale,
+            )
+            weightedAlpha += input[neighborIndex] * weight
+            weightTotal += weight
+          }
+        }
+        output[index] = weightedAlpha / weightTotal
+      }
+    }
+    const swap = input
+    input = output
+    output = swap
+  }
+
+  if (input !== alpha) alpha.set(input)
+}
+
+function colorBucket(pixels: Uint8ClampedArray, offset: number) {
+  const shift = 8 - COLOR_BUCKET_BITS
+  return (
+    (pixels[offset] >> shift)
+    | ((pixels[offset + 1] >> shift) << COLOR_BUCKET_BITS)
+    | (
+      (pixels[offset + 2] >> shift)
+      << (COLOR_BUCKET_BITS * 2)
+    )
+  )
+}
+
+function removeEnclosedBackgroundColorIslands(
+  pixels: Uint8ClampedArray,
+  alpha: Uint8ClampedArray,
+  width: number,
+  height: number,
+) {
+  const pixelCount = width * height
+  const backgroundCounts = new Uint32Array(COLOR_BUCKET_COUNT)
+  const foregroundCounts = new Uint32Array(COLOR_BUCKET_COUNT)
+
+  for (let index = 0; index < pixelCount; index += 1) {
+    const offset = index * 4
+    // Fully transparent source pixels have undefined RGB values and must not
+    // teach the color model that black is the removed photo background.
+    if (pixels[offset + 3] < 128) continue
+    const bucket = colorBucket(pixels, offset)
+    if (alpha[index] <= COLOR_ISLAND_BACKGROUND_ALPHA) {
+      backgroundCounts[bucket] += 1
+    } else if (alpha[index] >= COLOR_ISLAND_FOREGROUND_ALPHA) {
+      foregroundCounts[bucket] += 1
+    }
+  }
+
+  const minimumBucketSamples = Math.max(
+    24,
+    Math.round(pixelCount * 0.00001),
+  )
+  const candidates = new Uint8Array(pixelCount)
+  const growthCandidates = new Uint8Array(pixelCount)
+  for (let index = 0; index < pixelCount; index += 1) {
+    if (alpha[index] < COLOR_ISLAND_SEED_ALPHA) continue
+    const offset = index * 4
+    if (pixels[offset + 3] < 128) continue
+    const bucket = colorBucket(pixels, offset)
+    const background = backgroundCounts[bucket]
+    if (background < minimumBucketSamples) continue
+    const foreground = foregroundCounts[bucket]
+    const backgroundRatio = (
+      background / Math.max(1, background + foreground)
+    )
+    if (backgroundRatio >= COLOR_ISLAND_GROWTH_RATIO) {
+      growthCandidates[index] = 1
+    }
+    if (backgroundRatio >= COLOR_ISLAND_BACKGROUND_RATIO) {
+      candidates[index] = 1
+    }
+  }
+
+  const minimumArea = Math.max(
+    64,
+    Math.round(pixelCount * COLOR_ISLAND_MIN_AREA_FRACTION),
+  )
+  const maximumArea = Math.max(
+    minimumArea,
+    Math.round(pixelCount * COLOR_ISLAND_MAX_AREA_FRACTION),
+  )
+  const maximumClearance = Math.max(
+    12,
+    Math.round(
+      Math.min(width, height) * COLOR_ISLAND_MAX_CLEARANCE_FRACTION,
+    ),
+  )
+  const islands: number[][] = []
+  const islandBounds: Array<{
+    minX: number
+    minY: number
+    maxX: number
+    maxY: number
+  }> = []
+
+  for (let start = 0; start < pixelCount; start += 1) {
+    if (!candidates[start]) continue
+
+    const component = [start]
+    candidates[start] = 0
+    let minX = width
+    let minY = height
+    let maxX = -1
+    let maxY = -1
+
+    for (let read = 0; read < component.length; read += 1) {
+      const index = component[read]
+      const x = index % width
+      const y = Math.floor(index / width)
+      minX = Math.min(minX, x)
+      minY = Math.min(minY, y)
+      maxX = Math.max(maxX, x)
+      maxY = Math.max(maxY, y)
+
+      const xStart = Math.max(0, x - 1)
+      const xEnd = Math.min(width - 1, x + 1)
+      const yStart = Math.max(0, y - 1)
+      const yEnd = Math.min(height - 1, y + 1)
+      for (let neighborY = yStart; neighborY <= yEnd; neighborY += 1) {
+        const row = neighborY * width
+        for (let neighborX = xStart; neighborX <= xEnd; neighborX += 1) {
+          const neighbor = row + neighborX
+          if (!candidates[neighbor]) continue
+          candidates[neighbor] = 0
+          component.push(neighbor)
+        }
+      }
+    }
+
+    const nearAcceptedIsland = islandBounds.some(bounds => {
+      const horizontalGap = Math.max(
+        0,
+        bounds.minX - maxX - 1,
+        minX - bounds.maxX - 1,
+      )
+      const verticalGap = Math.max(
+        0,
+        bounds.minY - maxY - 1,
+        minY - bounds.maxY - 1,
+      )
+      return Math.sqrt(
+        horizontalGap * horizontalGap + verticalGap * verticalGap,
+      ) <= COLOR_ISLAND_SATELLITE_DISTANCE
+    })
+    if (
+      component.length < minimumArea
+      && (
+        component.length < COLOR_ISLAND_MIN_SATELLITE_AREA
+        || !nearAcceptedIsland
+      )
+    ) continue
+
+    if (component.length > maximumArea) continue
+
+    const componentWidth = maxX - minX + 1
+    const componentHeight = maxY - minY + 1
+    const clearance = Math.max(
+      12,
+      Math.min(
+        maximumClearance,
+        Math.ceil(
+          Math.max(componentWidth, componentHeight)
+          * COLOR_ISLAND_CLEARANCE_SCALE,
+        ),
+      ),
+    )
+    const searchLeft = Math.max(0, minX - clearance)
+    const searchTop = Math.max(0, minY - clearance)
+    const searchRight = Math.min(width - 1, maxX + clearance)
+    const searchBottom = Math.min(height - 1, maxY + clearance)
+    let enclosed = (
+      searchLeft > 0
+      && searchTop > 0
+      && searchRight < width - 1
+      && searchBottom < height - 1
+    )
+
+    // A true missed gap is buried inside the current silhouette. Reject
+    // background-colored clothing and highlights as soon as the existing
+    // transparent exterior appears within a component-scaled safety margin.
+    for (
+      let y = searchTop;
+      enclosed && y <= searchBottom;
+      y += 1
+    ) {
+      const row = y * width
+      for (let x = searchLeft; x <= searchRight; x += 1) {
+        if (alpha[row + x] <= COLOR_ISLAND_BACKGROUND_ALPHA) {
+          enclosed = false
+          break
+        }
+      }
+    }
+    if (!enclosed) continue
+
+    // The strict color component is only a trustworthy seed. Grow through
+    // neighboring bins that are more likely background than foreground so
+    // compression noise and screen scan lines are removed without blindly
+    // dilating into arms or clothing.
+    const growthLeft = Math.max(0, minX - COLOR_ISLAND_GROWTH_PADDING)
+    const growthTop = Math.max(0, minY - COLOR_ISLAND_GROWTH_PADDING)
+    const growthRight = Math.min(
+      width - 1,
+      maxX + COLOR_ISLAND_GROWTH_PADDING,
+    )
+    const growthBottom = Math.min(
+      height - 1,
+      maxY + COLOR_ISLAND_GROWTH_PADDING,
+    )
+    const grown = [...component]
+    for (const index of grown) growthCandidates[index] = 0
+    const maximumGrowthArea = Math.min(
+      maximumArea,
+      component.length * 3,
+    )
+    for (
+      let read = 0;
+      read < grown.length && grown.length <= maximumGrowthArea;
+      read += 1
+    ) {
+      const index = grown[read]
+      const x = index % width
+      const y = Math.floor(index / width)
+      const xStart = Math.max(growthLeft, x - 1)
+      const xEnd = Math.min(growthRight, x + 1)
+      const yStart = Math.max(growthTop, y - 1)
+      const yEnd = Math.min(growthBottom, y + 1)
+      for (let neighborY = yStart; neighborY <= yEnd; neighborY += 1) {
+        const row = neighborY * width
+        for (let neighborX = xStart; neighborX <= xEnd; neighborX += 1) {
+          const neighbor = row + neighborX
+          if (!growthCandidates[neighbor]) continue
+          growthCandidates[neighbor] = 0
+          grown.push(neighbor)
+        }
+      }
+    }
+    islands.push(
+      grown.length <= maximumGrowthArea ? grown : component,
+    )
+    islandBounds.push({ minX, minY, maxX, maxY })
+  }
+
+  const outerRadius = (
+    COLOR_ISLAND_EXPANSION_RADIUS + COLOR_ISLAND_FEATHER_RADIUS
+  )
+  for (const island of islands) {
+    for (const seed of island) {
+      const seedX = seed % width
+      const seedY = Math.floor(seed / width)
+      for (let dy = -outerRadius; dy <= outerRadius; dy += 1) {
+        const targetY = seedY + dy
+        if (targetY < 0 || targetY >= height) continue
+        for (let dx = -outerRadius; dx <= outerRadius; dx += 1) {
+          const targetX = seedX + dx
+          if (targetX < 0 || targetX >= width) continue
+          const distance = Math.sqrt(dx * dx + dy * dy)
+          if (distance > outerRadius) continue
+          const alphaCap = distance <= COLOR_ISLAND_EXPANSION_RADIUS
+            ? 0
+            : Math.round(
+                (distance - COLOR_ISLAND_EXPANSION_RADIUS)
+                / COLOR_ISLAND_FEATHER_RADIUS
+                * 255,
+              )
+          const target = targetY * width + targetX
+          alpha[target] = Math.min(alpha[target], alphaCap)
+        }
+      }
+    }
+  }
+}
+
+function snapAlphaToColorEdges(
+  pixels: Uint8ClampedArray,
+  alpha: Uint8ClampedArray,
+  width: number,
+  height: number,
+  radius: number,
+) {
+  const backgroundThreshold = 12
+  const foregroundThreshold = 243
+  const snapped = new Uint8ClampedArray(alpha)
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x
+      const currentAlpha = alpha[index]
+      if (
+        currentAlpha <= backgroundThreshold
+        || currentAlpha >= foregroundThreshold
+      ) continue
+
+      let foregroundIndex = -1
+      let backgroundIndex = -1
+      let foregroundDistance = Number.POSITIVE_INFINITY
+      let backgroundDistance = Number.POSITIVE_INFINITY
+
+      for (const [directionX, directionY] of COLOR_EDGE_DIRECTIONS) {
+        for (let step = 1; step <= radius; step += 1) {
+          const sampleX = x + directionX * step
+          const sampleY = y + directionY * step
+          if (
+            sampleX < 0
+            || sampleX >= width
+            || sampleY < 0
+            || sampleY >= height
+          ) break
+
+          const sampleIndex = sampleY * width + sampleX
+          const sampleAlpha = alpha[sampleIndex]
+          if (
+            sampleAlpha > backgroundThreshold
+            && sampleAlpha < foregroundThreshold
+          ) continue
+
+          const distance = step * (
+            directionX !== 0 && directionY !== 0 ? Math.SQRT2 : 1
+          )
+          if (
+            sampleAlpha >= foregroundThreshold
+            && distance < foregroundDistance
+          ) {
+            foregroundIndex = sampleIndex
+            foregroundDistance = distance
+          } else if (
+            sampleAlpha <= backgroundThreshold
+            && distance < backgroundDistance
+          ) {
+            backgroundIndex = sampleIndex
+            backgroundDistance = distance
+          }
+          break
+        }
+      }
+
+      if (foregroundIndex < 0 || backgroundIndex < 0) continue
+
+      const offset = index * 4
+      const foregroundOffset = foregroundIndex * 4
+      const backgroundOffset = backgroundIndex * 4
+      const redDelta = (
+        pixels[foregroundOffset] - pixels[backgroundOffset]
+      )
+      const greenDelta = (
+        pixels[foregroundOffset + 1] - pixels[backgroundOffset + 1]
+      )
+      const blueDelta = (
+        pixels[foregroundOffset + 2] - pixels[backgroundOffset + 2]
+      )
+      const contrast = (
+        redDelta * redDelta
+        + greenDelta * greenDelta
+        + blueDelta * blueDelta
+      )
+      if (contrast < 192) continue
+
+      const colorAlpha = Math.max(0, Math.min(1, (
+        (pixels[offset] - pixels[backgroundOffset]) * redDelta
+        + (pixels[offset + 1] - pixels[backgroundOffset + 1]) * greenDelta
+        + (pixels[offset + 2] - pixels[backgroundOffset + 2]) * blueDelta
+      ) / contrast))
+      const colorContrast = Math.sqrt(contrast / 3)
+      const contrastConfidence = Math.max(
+        0,
+        Math.min(0.82, (colorContrast - 8) / 48),
+      )
+      const distanceConfidence = Math.max(
+        0.35,
+        1 - Math.max(foregroundDistance, backgroundDistance) / (radius * 2),
+      )
+      const confidence = contrastConfidence * distanceConfidence
+      const priorAlpha = currentAlpha / 255
+      snapped[index] = Math.round((
+        priorAlpha * (1 - confidence) + colorAlpha * confidence
+      ) * 255)
+    }
+  }
+
+  alpha.set(snapped)
+}
+
+function decontaminateEdgeColors(
+  pixels: Uint8ClampedArray,
+  alpha: Uint8ClampedArray,
+  width: number,
+  height: number,
+  radius: number,
+) {
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x
+      const currentAlpha = alpha[index]
+      if (currentAlpha <= 5 || currentAlpha >= 250) continue
+
+      let bestIndex = -1
+      let bestAlpha = currentAlpha
+      let bestDistance = Number.POSITIVE_INFINITY
+      for (const [directionX, directionY] of COLOR_EDGE_DIRECTIONS) {
+        for (let step = 1; step <= radius; step += 1) {
+          const neighborX = x + directionX * step
+          const neighborY = y + directionY * step
+          if (
+            neighborX < 0
+            || neighborX >= width
+            || neighborY < 0
+            || neighborY >= height
+          ) break
+
+          const neighborIndex = neighborY * width + neighborX
+          const neighborAlpha = alpha[neighborIndex]
+          const distance = step * (
+            directionX !== 0 && directionY !== 0 ? Math.SQRT2 : 1
+          )
+          if (
+            neighborAlpha > bestAlpha
+            || (neighborAlpha === bestAlpha && distance < bestDistance)
+          ) {
+            bestAlpha = neighborAlpha
+            bestDistance = distance
+            bestIndex = neighborIndex
+          }
+          if (neighborAlpha >= 250) break
+        }
+      }
+      if (bestIndex < 0 || bestAlpha < currentAlpha + 12) continue
+
+      const offset = index * 4
+      const bestOffset = bestIndex * 4
+      const normalizedAlpha = currentAlpha / 255
+      const strength = Math.min(
+        0.9,
+        (bestAlpha - currentAlpha) / 255 + (1 - normalizedAlpha) * 0.35,
+      )
+      for (let channel = 0; channel < 3; channel += 1) {
+        pixels[offset + channel] = Math.round(
+          pixels[offset + channel] * (1 - strength)
+          + pixels[bestOffset + channel] * strength,
+        )
+      }
+    }
+  }
+}
+
+function applyFullResolutionAlpha(
+  context: OffscreenCanvasRenderingContext2D,
+  imageWidth: number,
+  imageHeight: number,
+  layers: MaskLayer[],
+) {
+  const pixels = context.getImageData(0, 0, imageWidth, imageHeight)
+  const data = pixels.data
+  const alpha = new Uint8ClampedArray(imageWidth * imageHeight)
+  const consensusLayerCount = layers.filter(
+    layer => (
+      layer.detail === 'person'
+      && layer.ownership
+    ),
+  ).length
+  // Pack the foreground veto flag and background vote count into one byte.
+  // This saves one full-resolution allocation on large camera images.
+  const consensusEvidence = consensusLayerCount >= 2
+    ? new Uint8Array(alpha.length)
+    : undefined
+  const lowestBackground = consensusLayerCount >= 2
+    ? new Uint8ClampedArray(alpha.length)
+    : undefined
+  lowestBackground?.fill(255)
+
+  layers.forEach((layer, index) => {
+    const contributesConsensus = (
+      layer.detail === 'person'
+      && Boolean(layer.ownership)
+    )
+    rasterizeMask(
+      alpha,
+      imageWidth,
+      layer,
+      index > 0,
+      contributesConsensus ? consensusEvidence : undefined,
+      contributesConsensus ? lowestBackground : undefined,
+    )
+  })
+  if (consensusEvidence && lowestBackground) {
+    for (let index = 0; index < alpha.length; index += 1) {
+      const evidence = consensusEvidence[index]
+      if (
+        (evidence & CONSENSUS_BACKGROUND_MASK)
+          >= CONSENSUS_BACKGROUND_VOTES
+        && (evidence & CONSENSUS_FOREGROUND_FLAG) === 0
+      ) {
+        alpha[index] = Math.min(alpha[index], lowestBackground[index])
+      }
+    }
+  }
+  removeEnclosedBackgroundColorIslands(
+    data,
+    alpha,
+    imageWidth,
+    imageHeight,
+  )
+  removeDetachedFullResolutionArtifacts(
+    alpha,
+    imageWidth,
+    imageHeight,
+  )
+  const maskScale = Math.max(...layers.map(layer => Math.max(
+    layer.source.width / layer.mask.width,
+    layer.source.height / layer.mask.height,
+  )))
+  edgeAwareFilter(data, alpha, imageWidth, imageHeight)
+  const colorEdgeRadius = Math.max(
+    4,
+    Math.min(MAX_COLOR_EDGE_RADIUS, Math.ceil(maskScale * 1.75)),
+  )
+  snapAlphaToColorEdges(
+    data,
+    alpha,
+    imageWidth,
+    imageHeight,
+    colorEdgeRadius,
+  )
+  const decontaminationRadius = Math.max(
+    4,
+    Math.min(8, Math.ceil(maskScale * 0.65)),
+  )
+  // Clean color spill while the edge is still a soft matte. Once polishAlpha
+  // hardens that transition, contaminated pixels may become fully opaque and
+  // are no longer distinguishable from true subject color.
+  decontaminateEdgeColors(
+    data,
+    alpha,
+    imageWidth,
+    imageHeight,
+    decontaminationRadius,
+  )
+
+  // The dedicated head crops carry substantially more strand information than
+  // the broad subject pass. Preserve softer alpha only across the upper part of
+  // those crops; the lower body and every non-hair edge keep the crisp curve.
+  const hairDetailZones = layers
+    .filter(layer => layer.detail === 'hair')
+    .map(layer => ({
+      left:layer.source.left,
+      top:layer.source.top,
+      right:layer.source.left + layer.source.width,
+      bottom:Math.min(
+        imageHeight,
+        Math.ceil(
+          layer.source.top
+          + layer.source.height * HAIR_DETAIL_ZONE_FRACTION,
+        ),
+      ),
+    }))
+
+  for (let index = 0; index < alpha.length; index += 1) {
+    const offset = index * 4
+    const currentAlpha = alpha[index]
+    let preserveFineDetail = false
+    if (
+      currentAlpha > 0
+      && currentAlpha < 255
+      && hairDetailZones.length > 0
+    ) {
+      const x = index % imageWidth
+      const y = Math.floor(index / imageWidth)
+      preserveFineDetail = hairDetailZones.some(
+        zone => (
+          x >= zone.left
+          && x < zone.right
+          && y >= zone.top
+          && y < zone.bottom
+        ),
+      )
+    }
+    alpha[index] = polishAlpha(currentAlpha, preserveFineDetail)
+    alpha[index] = Math.round(alpha[index] * data[offset + 3] / 255)
+  }
+
+  for (let index = 0; index < alpha.length; index += 1) {
+    data[index * 4 + 3] = alpha[index]
   }
   context.putImageData(pixels, 0, 0)
 }
@@ -222,27 +1462,43 @@ workerScope.onmessage = async ({ data }: MessageEvent<WorkerRequest>) => {
       height:bitmap.height,
     }
     report(data.id, 0.53, 'Finding the foreground')
-    let mask = await inferMask(
+    const baseMask = await inferMask(
       engine,
       createInferenceCanvas(bitmap, wholeImage),
     )
-    let maskSource = wholeImage
-
-    const refinementRect = findRefinementRect(
-      mask,
+    const layers: MaskLayer[] = [{ mask:baseMask, source:wholeImage }]
+    const personLayers = findPersonRefinementLayers(
+      baseMask,
       bitmap.width,
       bitmap.height,
     )
-    if (refinementRect) {
-      report(data.id, 0.72, 'Refining subject edges')
-      mask = await inferMask(
-        engine,
-        createInferenceCanvas(bitmap, refinementRect),
+    const refinementLayers = personLayers.length >= 2
+      ? personLayers
+      : findRefinementRects(
+          baseMask,
+          bitmap.width,
+          bitmap.height,
+        ).map(source => ({ source, detail:'person' as const }))
+    for (let index = 0; index < refinementLayers.length; index += 1) {
+      const refinementLayer = refinementLayers[index]
+      report(
+        data.id,
+        0.68 + (index / refinementLayers.length) * 0.16,
+        refinementLayer.detail === 'hair'
+          ? 'Refining hair and upper-body gaps'
+          : `Refining subject ${index + 1} of ${refinementLayers.length}`,
       )
-      maskSource = refinementRect
+      const inferredMask = await inferMask(
+        engine,
+        createInferenceCanvas(bitmap, refinementLayer.source),
+      )
+      const refinedMask = refinementLayer.detail === 'hair'
+        ? expandEnclosedBackgroundPockets(inferredMask)
+        : inferredMask
+      layers.push({ mask:refinedMask, ...refinementLayer })
     }
 
-    report(data.id, 0.88, 'Applying lossless full-resolution transparency')
+    report(data.id, 0.86, 'Snapping the matte to full-resolution edges')
     const outputCanvas = new OffscreenCanvas(bitmap.width, bitmap.height)
     const outputContext = outputCanvas.getContext('2d', { alpha:true })
     if (!outputContext) {
@@ -253,8 +1509,7 @@ workerScope.onmessage = async ({ data }: MessageEvent<WorkerRequest>) => {
       outputContext,
       bitmap.width,
       bitmap.height,
-      mask,
-      maskSource,
+      layers,
     )
 
     const blob = await outputCanvas.convertToBlob({ type:'image/png' })

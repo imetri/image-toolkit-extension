@@ -15,11 +15,13 @@ type PendingRequest = {
   resolve: (result: BackgroundResult) => void
   reject: (error: Error) => void
   onProgress?: (update: ProcessProgress) => void
+  refreshTimeout: () => void
   cleanup: () => void
 }
 
 let worker: Worker | undefined
 const pending = new Map<string, PendingRequest>()
+const BACKGROUND_REMOVAL_IDLE_TIMEOUT = 180_000
 
 const abortError = () =>
   new DOMException('Image processing was cancelled', 'AbortError')
@@ -45,6 +47,7 @@ function getWorker() {
     const request = pending.get(data.id)
     if (!request) return
     if (data.type === 'progress') {
+      request.refreshTimeout()
       request.onProgress?.({ progress:data.progress, stage:data.stage })
       return
     }
@@ -76,21 +79,34 @@ export function removeImageBackground(
   const id = crypto.randomUUID()
 
   return new Promise<BackgroundResult>((resolve, reject) => {
-    const timeout = window.setTimeout(() => {
-      if (!pending.has(id)) return
-      stopWorker(new Error('Background removal took too long to complete.'))
-    }, 180_000)
+    let timeout: number | undefined
+    const refreshTimeout = () => {
+      if (timeout !== undefined) window.clearTimeout(timeout)
+      timeout = window.setTimeout(() => {
+        if (!pending.has(id)) return
+        stopWorker(new Error(
+          'Background removal stopped responding before it could complete.',
+        ))
+      }, BACKGROUND_REMOVAL_IDLE_TIMEOUT)
+    }
     const cancel = () => {
       if (!pending.has(id)) return
       stopWorker(abortError())
     }
     const cleanup = () => {
-      window.clearTimeout(timeout)
+      if (timeout !== undefined) window.clearTimeout(timeout)
       signal?.removeEventListener('abort', cancel)
     }
 
-    pending.set(id, { resolve, reject, onProgress, cleanup })
+    pending.set(id, {
+      resolve,
+      reject,
+      onProgress,
+      refreshTimeout,
+      cleanup,
+    })
     signal?.addEventListener('abort', cancel, { once:true })
+    refreshTimeout()
     getWorker().postMessage({ type:'remove-background', id, image })
   })
 }
