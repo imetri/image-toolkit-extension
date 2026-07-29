@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+  import { useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import JSZip from "jszip";
 import {
@@ -25,6 +25,8 @@ import { IMAGE_FILE_ACCEPT, isRawImage } from "./lib/imageFormats";
 import { rawProcessingConcurrency } from "./lib/rawDecoder";
 import { formatBytes } from "./lib/utils";
 import type { Operation, OutputFormat, ProcessedItem } from "./types";
+
+const BUILD_VERSION = "0.1.1";
 
 type BatchProgress = {
   current: number;
@@ -116,6 +118,10 @@ export default function App() {
     processingRef.current?.abort();
     processingRef.current = controller;
     const pending = [...items];
+    results.forEach((item) => {
+      if (item.preview.startsWith("blob:")) URL.revokeObjectURL(item.preview);
+    });
+    setResults([]);
     setProcessing(true);
     const startedAt = performance.now();
     setBatchProgress({
@@ -304,7 +310,7 @@ export default function App() {
             <Zap size={19} fill="currentColor" />
           </span>
           <strong>imageflow</strong>
-          <span>BETA</span>
+          <span>BETA · {BUILD_VERSION}</span>
         </div>
       </header>
 
