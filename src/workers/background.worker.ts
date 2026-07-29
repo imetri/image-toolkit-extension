@@ -51,8 +51,7 @@ const COLOR_ISLAND_SEED_ALPHA = 224
 const COLOR_ISLAND_BACKGROUND_RATIO = 0.97
 const COLOR_ISLAND_GROWTH_RATIO = 0.5
 const COLOR_ISLAND_MIN_AREA_FRACTION = 0.00004
-const COLOR_ISLAND_MIN_SATELLITE_AREA = 12
-const COLOR_ISLAND_SATELLITE_DISTANCE = 24
+const COLOR_ISLAND_MIN_FILL_RATIO = 0.38
 const COLOR_ISLAND_MAX_AREA_FRACTION = 0.004
 const COLOR_ISLAND_CLEARANCE_SCALE = 1.2
 const COLOR_ISLAND_MAX_CLEARANCE_FRACTION = 0.08
@@ -949,12 +948,6 @@ function removeEnclosedBackgroundColorIslands(
     ),
   )
   const islands: number[][] = []
-  const islandBounds: Array<{
-    minX: number
-    minY: number
-    maxX: number
-    maxY: number
-  }> = []
 
   for (let start = 0; start < pixelCount; start += 1) {
     if (!candidates[start]) continue
@@ -990,33 +983,19 @@ function removeEnclosedBackgroundColorIslands(
       }
     }
 
-    const nearAcceptedIsland = islandBounds.some(bounds => {
-      const horizontalGap = Math.max(
-        0,
-        bounds.minX - maxX - 1,
-        minX - bounds.maxX - 1,
-      )
-      const verticalGap = Math.max(
-        0,
-        bounds.minY - maxY - 1,
-        minY - bounds.maxY - 1,
-      )
-      return Math.sqrt(
-        horizontalGap * horizontalGap + verticalGap * verticalGap,
-      ) <= COLOR_ISLAND_SATELLITE_DISTANCE
-    })
-    if (
-      component.length < minimumArea
-      && (
-        component.length < COLOR_ISLAND_MIN_SATELLITE_AREA
-        || !nearAcceptedIsland
-      )
-    ) continue
-
+    if (component.length < minimumArea) continue
     if (component.length > maximumArea) continue
 
     const componentWidth = maxX - minX + 1
     const componentHeight = maxY - minY + 1
+    const componentFill = (
+      component.length / (componentWidth * componentHeight)
+    )
+    // Genuine enclosed background openings have a coherent interior. Sparse
+    // chains are much more likely to be whiskers, dark fur, eyelashes, or
+    // other textured subject detail that happens to match the background.
+    if (componentFill < COLOR_ISLAND_MIN_FILL_RATIO) continue
+
     const clearance = Math.max(
       12,
       Math.min(
@@ -1101,7 +1080,6 @@ function removeEnclosedBackgroundColorIslands(
     islands.push(
       grown.length <= maximumGrowthArea ? grown : component,
     )
-    islandBounds.push({ minX, minY, maxX, maxY })
   }
 
   const outerRadius = (
