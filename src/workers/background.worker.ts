@@ -70,6 +70,7 @@ const COLOR_BUCKET_COUNT = 1 << (COLOR_BUCKET_BITS * 3)
 const COLOR_ISLAND_BACKGROUND_ALPHA = 24
 const COLOR_ISLAND_FOREGROUND_ALPHA = 232
 const COLOR_ISLAND_SEED_ALPHA = 224
+const COLOR_ISLAND_REFINEMENT_BACKGROUND_VOTES = 1
 const COLOR_ISLAND_BACKGROUND_RATIO = 0.97
 const COLOR_ISLAND_GROWTH_RATIO = 0.5
 const COLOR_ISLAND_MIN_AREA_FRACTION = 0.00004
@@ -957,6 +958,7 @@ function rasterizeMask(
   blendAtBorder: boolean,
   consensusEvidence?: Uint8Array,
   lowestBackground?: Uint8ClampedArray,
+  refinementEvidence?: Uint8Array,
 ) {
   const { mask, source, ownership } = layer
   const consensusMargin = Math.max(
@@ -1005,37 +1007,49 @@ function rasterizeMask(
         + mask.data[upperRow + x1[x]] * horizontalWeight
       const predicted = top * (1 - yWeight) + bottom * yWeight
       const outputIndex = outputRow + x
+      const outputX = source.left + x
+      const isOwnedPixel = (
+        !ownership
+        || (outputX >= ownership.left && outputX < ownership.right)
+      )
+      const isCropInterior = (
+        x >= consensusMargin
+        && y >= consensusMargin
+        && x < source.width - consensusMargin
+        && y < source.height - consensusMargin
+      )
+      if (refinementEvidence && isCropInterior && isOwnedPixel) {
+        const evidence = refinementEvidence[outputIndex]
+        if (predicted <= CONSENSUS_BACKGROUND_THRESHOLD) {
+          const votes = evidence & CONSENSUS_BACKGROUND_MASK
+          refinementEvidence[outputIndex] = (
+            evidence & CONSENSUS_FOREGROUND_FLAG
+          ) | Math.min(CONSENSUS_BACKGROUND_MASK, votes + 1)
+        } else if (predicted >= CONSENSUS_FOREGROUND_THRESHOLD) {
+          refinementEvidence[outputIndex] |= CONSENSUS_FOREGROUND_FLAG
+        }
+      }
       if (
         consensusEvidence
         && lowestBackground
+        && isCropInterior
       ) {
-        if (
-          x >= consensusMargin
-          && y >= consensusMargin
-          && x < source.width - consensusMargin
-          && y < source.height - consensusMargin
-        ) {
-          if (predicted <= CONSENSUS_BACKGROUND_THRESHOLD) {
-            const evidence = consensusEvidence[outputIndex]
-            const votes = evidence & CONSENSUS_BACKGROUND_MASK
-            consensusEvidence[outputIndex] = (
-              evidence & CONSENSUS_FOREGROUND_FLAG
-            ) | Math.min(CONSENSUS_BACKGROUND_MASK, votes + 1)
-            lowestBackground[outputIndex] = Math.min(
-              lowestBackground[outputIndex],
-              Math.round(predicted),
-            )
-          } else if (predicted >= CONSENSUS_FOREGROUND_THRESHOLD) {
-            consensusEvidence[outputIndex] |= CONSENSUS_FOREGROUND_FLAG
-          }
+        if (predicted <= CONSENSUS_BACKGROUND_THRESHOLD) {
+          const evidence = consensusEvidence[outputIndex]
+          const votes = evidence & CONSENSUS_BACKGROUND_MASK
+          consensusEvidence[outputIndex] = (
+            evidence & CONSENSUS_FOREGROUND_FLAG
+          ) | Math.min(CONSENSUS_BACKGROUND_MASK, votes + 1)
+          lowestBackground[outputIndex] = Math.min(
+            lowestBackground[outputIndex],
+            Math.round(predicted),
+          )
+        } else if (predicted >= CONSENSUS_FOREGROUND_THRESHOLD) {
+          consensusEvidence[outputIndex] |= CONSENSUS_FOREGROUND_FLAG
         }
       }
 
-      const outputX = source.left + x
-      if (
-        ownership
-        && (outputX < ownership.left || outputX >= ownership.right)
-      ) continue
+      if (!isOwnedPixel) continue
       if (!blendAtBorder) {
         alpha[outputIndex] = predicted
         continue
@@ -1159,7 +1173,13 @@ function removeEnclosedBackgroundColorIslands(
   alpha: Uint8ClampedArray,
   width: number,
   height: number,
+  refinementEvidence?: Uint8Array,
 ) {
+  // Color similarity is never enough to punch a hole through a strong
+  // foreground prediction. A separate refinement crop must classify each
+  // affected pixel as background, and no refinement may strongly veto it.
+  if (!refinementEvidence) return
+
   const pixelCount = width * height
   const backgroundCounts = new Uint32Array(COLOR_BUCKET_COUNT)
   const foregroundCounts = new Uint32Array(COLOR_BUCKET_COUNT)
@@ -1185,6 +1205,12 @@ function removeEnclosedBackgroundColorIslands(
   const growthCandidates = new Uint8Array(pixelCount)
   for (let index = 0; index < pixelCount; index += 1) {
     if (alpha[index] < COLOR_ISLAND_SEED_ALPHA) continue
+    const evidence = refinementEvidence[index]
+    if (
+      (evidence & CONSENSUS_BACKGROUND_MASK)
+        < COLOR_ISLAND_REFINEMENT_BACKGROUND_VOTES
+      || (evidence & CONSENSUS_FOREGROUND_FLAG) !== 0
+    ) continue
     const offset = index * 4
     if (pixels[offset + 3] < 128) continue
     const bucket = colorBucket(pixels, offset)
@@ -1374,6 +1400,12 @@ function removeEnclosedBackgroundColorIslands(
                 * 255,
               )
           const target = targetY * width + targetX
+          const evidence = refinementEvidence[target]
+          if (
+            (evidence & CONSENSUS_BACKGROUND_MASK)
+              < COLOR_ISLAND_REFINEMENT_BACKGROUND_VOTES
+            || (evidence & CONSENSUS_FOREGROUND_FLAG) !== 0
+          ) continue
           alpha[target] = Math.min(alpha[target], alphaCap)
         }
       }
@@ -1741,6 +1773,9 @@ function applyFullResolutionAlpha(
   const consensusEvidence = consensusLayerCount >= 2
     ? new Uint8Array(alpha.length)
     : undefined
+  const refinementEvidence = layers.length >= 2
+    ? new Uint8Array(alpha.length)
+    : undefined
   const lowestBackground = consensusLayerCount >= 2
     ? new Uint8ClampedArray(alpha.length)
     : undefined
@@ -1758,6 +1793,7 @@ function applyFullResolutionAlpha(
       index > 0,
       contributesConsensus ? consensusEvidence : undefined,
       contributesConsensus ? lowestBackground : undefined,
+      index > 0 ? refinementEvidence : undefined,
     )
   })
   if (consensusEvidence && lowestBackground) {
@@ -1777,6 +1813,7 @@ function applyFullResolutionAlpha(
     alpha,
     imageWidth,
     imageHeight,
+    refinementEvidence,
   )
   removeDetachedFullResolutionArtifacts(
     alpha,
