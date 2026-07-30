@@ -87,6 +87,8 @@ export async function processImage(item: ImageItem, options: ProcessOptions, sig
       outputSize:blob.size,
       width:processed.width,
       height:processed.height,
+      refinable:true,
+      restoreSource:input,
       status:'done',
     }
   }

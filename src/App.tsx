@@ -1,4 +1,4 @@
-  import { useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import JSZip from "jszip";
 import {
@@ -12,6 +12,7 @@ import {
   Eraser,
   Maximize2,
   Play,
+  Paintbrush,
   Plus,
   Trash2,
   UploadCloud,
@@ -19,6 +20,7 @@ import {
   Zap,
 } from "lucide-react";
 import { Button, Toggle } from "./components/ui";
+import { RefineEditor } from "./components/RefineEditor";
 import { useImageQueue } from "./hooks/useImageQueue";
 import { processImage } from "./lib/imageProcessor";
 import { IMAGE_FILE_ACCEPT, isRawImage } from "./lib/imageFormats";
@@ -85,6 +87,7 @@ export default function App() {
   const [height, setHeight] = useState<number | undefined>();
   const [percentage, setPercentage] = useState<number | undefined>(100);
   const [quality, setQuality] = useState(82);
+  const [refiningItem, setRefiningItem] = useState<ProcessedItem | null>(null);
 
   const totalInputSize = useMemo(
     () => items.reduce((sum, item) => sum + item.file.size, 0),
@@ -261,6 +264,21 @@ export default function App() {
     anchor.download = item.name;
     anchor.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  const saveRefinement = (itemId: string, blob: Blob) => {
+    setResults((current) => current.map((item) => {
+      if (item.id !== itemId) return item;
+      if (item.preview.startsWith("blob:")) URL.revokeObjectURL(item.preview);
+      return {
+        ...item,
+        blob,
+        preview:URL.createObjectURL(blob),
+        outputSize:blob.size,
+      };
+    }));
+    setRefiningItem(null);
+    setNotice("Manual refinement applied.");
   };
 
   const downloadAllFiles = () => {
@@ -666,7 +684,7 @@ export default function App() {
                 {results.map((item) => (
                   <article key={item.id}>
                     <img src={item.preview} alt="" />
-                    <div>
+                    <div className="result-item-meta">
                       <strong>{item.name}</strong>
                       <small>
                         {item.width && item.height
@@ -675,13 +693,27 @@ export default function App() {
                         {formatBytes(item.outputSize)}
                       </small>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => downloadFile(item)}
-                      aria-label={`Download ${item.name}`}
-                    >
-                      <Download size={16} />
-                    </button>
+                    <div className="result-item-actions">
+                      {item.refinable && (
+                        <button
+                          type="button"
+                          className="refine-result-button"
+                          onClick={() => setRefiningItem(item)}
+                          aria-label={`Refine ${item.name}`}
+                        >
+                          <Paintbrush size={15} />
+                          <span>Refine</span>
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="download-result-button"
+                        onClick={() => downloadFile(item)}
+                        aria-label={`Download ${item.name}`}
+                      >
+                        <Download size={16} />
+                      </button>
+                    </div>
                   </article>
                 ))}
               </div>
@@ -711,6 +743,14 @@ export default function App() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {refiningItem && (
+        <RefineEditor
+          item={refiningItem}
+          onClose={() => setRefiningItem(null)}
+          onSave={blob => saveRefinement(refiningItem.id, blob)}
+        />
+      )}
     </div>
   );
 }
