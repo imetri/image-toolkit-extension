@@ -80,7 +80,8 @@ const MIN_ZOOM = 1;
 const MAX_ZOOM = 8;
 const UNDO_LIMIT = 12;
 const UNDO_TILE_SIZE = 128;
-const MAGIC_CANDIDATE_THRESHOLD = 64;
+const MAGIC_CANDIDATE_THRESHOLD = 32;
+const MAGIC_MASK_ALPHA_THRESHOLD = 8;
 
 function loadImage(blob: Blob): Promise<LoadedImage> {
   return new Promise((resolve, reject) => {
@@ -554,7 +555,6 @@ export function RefineEditor({
         throw new Error("Paint over a visible area to create an AI selection.");
       }
       const selectForeground = paintedAlpha / paintedCount >= 127.5;
-      const strengths = new Uint8Array(pixelCount);
       const candidates = new Uint8Array(pixelCount);
       const selected = new Uint8Array(pixelCount);
       const queue = new Int32Array(pixelCount);
@@ -566,11 +566,10 @@ export function RefineEditor({
         const sideStrength = selectForeground
           ? predicted
           : 255 - predicted;
-        const strength = Math.round(
-          sideStrength * visiblePixels[offset + 3] / 255,
-        );
-        strengths[index] = strength;
-        if (strength >= MAGIC_CANDIDATE_THRESHOLD) {
+        if (
+          visiblePixels[offset + 3] > 0
+          && sideStrength >= MAGIC_CANDIDATE_THRESHOLD
+        ) {
           candidates[index] = 1;
           if (seedPixels[offset + 3] > 24) {
             selected[index] = 1;
@@ -638,7 +637,7 @@ export function RefineEditor({
         previewPixels.data[offset] = 83;
         previewPixels.data[offset + 1] = 218;
         previewPixels.data[offset + 2] = 190;
-        previewPixels.data[offset + 3] = strengths[index];
+        previewPixels.data[offset + 3] = 255;
       }
       previewContext.putImageData(previewPixels, 0, 0);
       magicContext.clearRect(0, 0, magicCanvas.width, magicCanvas.height);
@@ -654,6 +653,23 @@ export function RefineEditor({
         cropWidth,
         cropHeight,
       );
+      const fullResolutionMask = magicContext.getImageData(
+        left,
+        top,
+        cropWidth,
+        cropHeight,
+      );
+      for (
+        let offset = 3;
+        offset < fullResolutionMask.data.length;
+        offset += 4
+      ) {
+        fullResolutionMask.data[offset] =
+          fullResolutionMask.data[offset] >= MAGIC_MASK_ALPHA_THRESHOLD
+            ? 255
+            : 0;
+      }
+      magicContext.putImageData(fullResolutionMask, left, top);
       magicSelectionRef.current = { left, top, right, bottom };
       setHasMagicSelection(true);
       setMagicStatus("AI selection ready");
