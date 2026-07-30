@@ -18,7 +18,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { removeImageBackground } from "../lib/backgroundRemoval";
+import { createMagicSelectionMask } from "../lib/backgroundRemoval";
 import type { ProcessedItem } from "../types";
 import { Button } from "./ui";
 
@@ -452,39 +452,32 @@ export function RefineEditor({
     setError("");
     setMagicStatus("Preparing AI selection");
 
-    let analyzed: LoadedImage | undefined;
     try {
-      const cropBlob = await canvasPng(cropCanvas);
-      const result = await removeImageBackground(
-        cropBlob,
+      const analysisSeeds = points.map(point => ({
+        x: (point.x - left) * analysisScale,
+        y: (point.y - top) * analysisScale,
+        radius: Math.max(1, point.radius * analysisScale * 0.58),
+      }));
+      const cropBitmap = await createImageBitmap(cropCanvas);
+      if (controller.signal.aborted) {
+        cropBitmap.close();
+        return;
+      }
+      const result = await createMagicSelectionMask(
+        cropBitmap,
+        analysisSeeds,
         controller.signal,
         update => setMagicStatus(update.stage),
       );
       if (controller.signal.aborted) return;
-      analyzed = await loadImage(result.blob);
-      if (controller.signal.aborted) return;
-
-      const resultCanvas = document.createElement("canvas");
-      resultCanvas.width = analysisWidth;
-      resultCanvas.height = analysisHeight;
-      const resultContext = resultCanvas.getContext(
-        "2d",
-        { willReadFrequently:true },
-      );
-      if (!resultContext) throw new Error("Unable to read the AI selection.");
-      resultContext.drawImage(
-        analyzed.image,
-        0,
-        0,
-        analysisWidth,
-        analysisHeight,
-      );
-      const resultPixels = resultContext.getImageData(
-        0,
-        0,
-        analysisWidth,
-        analysisHeight,
-      ).data;
+      if (
+        result.width !== analysisWidth
+        || result.height !== analysisHeight
+        || result.mask.length !== analysisWidth * analysisHeight
+      ) {
+        throw new Error("The AI returned an invalid selection mask.");
+      }
+      const resultPixels = result.mask;
 
       const visibleCanvas = document.createElement("canvas");
       visibleCanvas.width = analysisWidth;
@@ -521,12 +514,12 @@ export function RefineEditor({
       );
       if (!seedContext) throw new Error("Unable to read the painted hint.");
       seedContext.fillStyle = "#fff";
-      for (const point of points) {
+      for (const seed of analysisSeeds) {
         seedContext.beginPath();
         seedContext.arc(
-          (point.x - left) * analysisScale,
-          (point.y - top) * analysisScale,
-          Math.max(1, point.radius * analysisScale * 0.58),
+          seed.x,
+          seed.y,
+          seed.radius,
           0,
           Math.PI * 2,
         );
@@ -547,7 +540,7 @@ export function RefineEditor({
           seedPixels[offset + 3] > 24
           && visiblePixels[offset + 3] > 4
         ) {
-          paintedAlpha += resultPixels[offset + 3];
+          paintedAlpha += resultPixels[index];
           paintedCount += 1;
         }
       }
@@ -562,7 +555,7 @@ export function RefineEditor({
 
       for (let index = 0; index < pixelCount; index += 1) {
         const offset = index * 4;
-        const predicted = resultPixels[offset + 3];
+        const predicted = resultPixels[index];
         const sideStrength = selectForeground
           ? predicted
           : 255 - predicted;
@@ -686,7 +679,6 @@ export function RefineEditor({
         );
       }
     } finally {
-      analyzed?.release();
       if (magicAbortRef.current === controller) {
         magicAbortRef.current = undefined;
         setAnalyzing(false);
