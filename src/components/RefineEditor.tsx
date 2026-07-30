@@ -83,7 +83,7 @@ const UNDO_TILE_SIZE = 128;
 const MAGIC_CANDIDATE_THRESHOLD = 32;
 const MAGIC_EDGE_CANDIDATE_THRESHOLD = 12;
 const MAGIC_MASK_ALPHA_THRESHOLD = 8;
-const MAGIC_GROWTH_RADIUS_SCALE = 3;
+const MAGIC_GROWTH_RADIUS_SCALE = 1.75;
 const MAGIC_EDGE_EXPANSION_PASSES = 3;
 const MAGIC_MIN_ALPHA_TOLERANCE = 40;
 const MAGIC_MAX_ALPHA_TOLERANCE = 128;
@@ -467,6 +467,11 @@ export function RefineEditor({
         y: (point.y - top) * analysisScale,
         radius: Math.max(1, point.radius * analysisScale * 0.58),
       }));
+      const analysisPaintPoints = points.map(point => ({
+        x: (point.x - left) * analysisScale,
+        y: (point.y - top) * analysisScale,
+        radius: Math.max(1, point.radius * analysisScale),
+      }));
       const cropBitmap = await createImageBitmap(cropCanvas);
       if (controller.signal.aborted) {
         cropBitmap.close();
@@ -514,27 +519,55 @@ export function RefineEditor({
         analysisHeight,
       ).data;
 
-      const seedCanvas = document.createElement("canvas");
-      seedCanvas.width = analysisWidth;
-      seedCanvas.height = analysisHeight;
-      const seedContext = seedCanvas.getContext(
+      const sampleCanvas = document.createElement("canvas");
+      sampleCanvas.width = analysisWidth;
+      sampleCanvas.height = analysisHeight;
+      const sampleContext = sampleCanvas.getContext(
         "2d",
         { willReadFrequently:true },
       );
-      if (!seedContext) throw new Error("Unable to read the painted hint.");
-      seedContext.fillStyle = "#fff";
+      if (!sampleContext) throw new Error("Unable to read the painted hint.");
+      sampleContext.fillStyle = "#fff";
       for (const seed of analysisSeeds) {
-        seedContext.beginPath();
-        seedContext.arc(
+        sampleContext.beginPath();
+        sampleContext.arc(
           seed.x,
           seed.y,
           seed.radius,
           0,
           Math.PI * 2,
         );
-        seedContext.fill();
+        sampleContext.fill();
       }
-      const seedPixels = seedContext.getImageData(
+      const samplePixels = sampleContext.getImageData(
+        0,
+        0,
+        analysisWidth,
+        analysisHeight,
+      ).data;
+      const paintCanvas = document.createElement("canvas");
+      paintCanvas.width = analysisWidth;
+      paintCanvas.height = analysisHeight;
+      const paintContext = paintCanvas.getContext(
+        "2d",
+        { willReadFrequently:true },
+      );
+      if (!paintContext) {
+        throw new Error("Unable to preserve the painted selection.");
+      }
+      paintContext.fillStyle = "#fff";
+      for (const point of analysisPaintPoints) {
+        paintContext.beginPath();
+        paintContext.arc(
+          point.x,
+          point.y,
+          point.radius,
+          0,
+          Math.PI * 2,
+        );
+        paintContext.fill();
+      }
+      const paintPixels = paintContext.getImageData(
         0,
         0,
         analysisWidth,
@@ -551,12 +584,12 @@ export function RefineEditor({
         throw new Error("Unable to constrain the AI selection.");
       }
       growthContext.fillStyle = "#fff";
-      for (const seed of analysisSeeds) {
+      for (const point of analysisPaintPoints) {
         growthContext.beginPath();
         growthContext.arc(
-          seed.x,
-          seed.y,
-          seed.radius * MAGIC_GROWTH_RADIUS_SCALE,
+          point.x,
+          point.y,
+          point.radius * MAGIC_GROWTH_RADIUS_SCALE,
           0,
           Math.PI * 2,
         );
@@ -582,9 +615,32 @@ export function RefineEditor({
       for (let index = 0; index < pixelCount; index += 1) {
         const offset = index * 4;
         if (
-          seedPixels[offset + 3] > 24
+          samplePixels[offset + 3] > 24
           && visiblePixels[offset + 3] > 4
         ) {
+          const red = visiblePixels[offset];
+          const green = visiblePixels[offset + 1];
+          const blue = visiblePixels[offset + 2];
+          const alpha = visiblePixels[offset + 3];
+          paintedModelAlpha += resultPixels[index];
+          paintedVisibleAlpha += alpha;
+          paintedRed += red;
+          paintedGreen += green;
+          paintedBlue += blue;
+          paintedAlphaSquared += alpha * alpha;
+          paintedRedSquared += red * red;
+          paintedGreenSquared += green * green;
+          paintedBlueSquared += blue * blue;
+          paintedCount += 1;
+        }
+      }
+      if (!paintedCount) {
+        for (let index = 0; index < pixelCount; index += 1) {
+          const offset = index * 4;
+          if (
+            paintPixels[offset + 3] <= 24
+            || visiblePixels[offset + 3] <= 4
+          ) continue;
           const red = visiblePixels[offset];
           const green = visiblePixels[offset + 1];
           const blue = visiblePixels[offset + 2];
@@ -646,12 +702,20 @@ export function RefineEditor({
         const sideStrength = selectForeground
           ? predicted
           : 255 - predicted;
-        const isSeed = seedPixels[offset + 3] > 24;
+        const isPainted = paintPixels[offset + 3] > 24;
         if (
           visiblePixels[offset + 3] > 0
           && growthPixels[offset + 3] > 24
-          && sideStrength >= MAGIC_EDGE_CANDIDATE_THRESHOLD
         ) {
+          if (isPainted) {
+            aiCandidates[index] = 1;
+            candidates[index] = 1;
+            selected[index] = 1;
+            queue[write] = index;
+            write += 1;
+            continue;
+          }
+          if (sideStrength < MAGIC_EDGE_CANDIDATE_THRESHOLD) continue;
           aiCandidates[index] = 1;
           const redDifference = visiblePixels[offset] - meanRed;
           const greenDifference = visiblePixels[offset + 1] - meanGreen;
@@ -669,14 +733,9 @@ export function RefineEditor({
           );
           if (
             sideStrength >= MAGIC_CANDIDATE_THRESHOLD
-            && (isSeed || appearanceMatches)
+            && appearanceMatches
           ) {
             candidates[index] = 1;
-          }
-          if (isSeed) {
-            selected[index] = 1;
-            queue[write] = index;
-            write += 1;
           }
         }
       }
