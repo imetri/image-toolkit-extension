@@ -19,7 +19,7 @@ const COMPONENT_THRESHOLD = 24
 const REFINEMENT_PADDING = 0.14
 const MAX_REFINEMENT_PASSES = 4
 const MAX_PERSON_REFINEMENT_PASSES = 8
-const MAX_UNCERTAINTY_REFINEMENT_PASSES = 2
+const MAX_EDGE_REFINEMENT_PASSES = 4
 const MAX_TOTAL_REFINEMENT_PASSES = 12
 const MIN_COMPONENT_FRACTION = 0.001
 const HEAD_THRESHOLD = 100
@@ -38,16 +38,22 @@ const HEAD_CROP_TOP_PADDING = 0.55
 const HAIR_DETAIL_ZONE_FRACTION = 0.72
 const HAIR_ALPHA_CURVE_POWER = 2.2
 const STANDARD_ALPHA_CURVE_POWER = 4
-const UNCERTAINTY_CROP_SCALE = 0.46
-const UNCERTAINTY_CROP_MIN_EDGE = 88
-const UNCERTAINTY_CROP_MAX_FRAME_FRACTION = 0.7
-const UNCERTAINTY_CROP_STRIDE_FRACTION = 0.16
-const UNCERTAINTY_CROP_PADDING = 0.1
-const UNCERTAINTY_MIN_DENSITY = 0.0015
-const UNCERTAINTY_MIN_FOREGROUND_COVERAGE = 0.06
-const UNCERTAINTY_MAX_FOREGROUND_COVERAGE = 0.94
-const UNCERTAINTY_MAX_OVERLAP = 0.42
-const REFINEMENT_DUPLICATE_OVERLAP = 0.68
+const EDGE_TILE_SCALE = 0.3
+const EDGE_TILE_MIN_EDGE = 72
+const EDGE_TILE_MAX_FRAME_FRACTION = 0.42
+const EDGE_TILE_STRIDE_FRACTION = 0.22
+const EDGE_TILE_PADDING = 0.12
+const EDGE_TILE_MIN_DETAIL_DENSITY = 0.006
+const EDGE_TILE_TRIGGER_DENSITY = 0.012
+const EDGE_TILE_MEDIUM_DETAIL_DENSITY = 0.015
+const EDGE_TILE_HIGH_DETAIL_DENSITY = 0.02
+const EDGE_TILE_MIN_FOREGROUND_COVERAGE = 0.04
+const EDGE_TILE_MAX_FOREGROUND_COVERAGE = 0.9
+const EDGE_TILE_MAX_OVERLAP = 0.3
+const EDGE_BACKGROUND_THRESHOLD = 72
+const EDGE_FOREGROUND_THRESHOLD = 183
+const REFINEMENT_DUPLICATE_OVERLAP = 0.58
+const REFINEMENT_DUPLICATE_AREA_RATIO = 0.55
 const CONSENSUS_CROP_MARGIN = 0.04
 const CONSENSUS_BACKGROUND_THRESHOLD = 56
 const CONSENSUS_FOREGROUND_THRESHOLD = 210
@@ -103,7 +109,7 @@ type SourceRect = {
 type MaskLayer = {
   mask: RawImage
   source: SourceRect
-  detail?: 'person' | 'hair' | 'uncertainty'
+  detail?: 'person' | 'hair' | 'edge'
   ownership?: {
     left: number
     right: number
@@ -545,7 +551,7 @@ function scanPositions(maximum: number, stride: number) {
   return positions
 }
 
-function findUncertaintyRefinementLayers(
+function findEdgeRefinementLayers(
   mask: RawImage,
   imageWidth: number,
   imageHeight: number,
@@ -556,42 +562,74 @@ function findUncertaintyRefinementLayers(
 
   const foregroundWidth = foreground.maxX - foreground.minX + 1
   const foregroundHeight = foreground.maxY - foreground.minY + 1
-  const maximumCropEdge = Math.max(
+  const maximumTileEdge = Math.max(
     2,
     Math.floor(
       Math.min(mask.width, mask.height)
-      * UNCERTAINTY_CROP_MAX_FRAME_FRACTION,
+      * EDGE_TILE_MAX_FRAME_FRACTION,
     ),
   )
-  const cropEdge = Math.min(
-    maximumCropEdge,
+  const tileEdge = Math.min(
+    maximumTileEdge,
     Math.max(
-      Math.min(UNCERTAINTY_CROP_MIN_EDGE, maximumCropEdge),
+      Math.min(EDGE_TILE_MIN_EDGE, maximumTileEdge),
       Math.round(
-        Math.max(foregroundWidth, foregroundHeight)
-        * UNCERTAINTY_CROP_SCALE,
+        Math.max(foregroundWidth, foregroundHeight) * EDGE_TILE_SCALE,
       ),
     ),
   )
-  if (cropEdge < 2) return []
+  if (tileEdge < 2) return []
 
   const integralStride = mask.width + 1
-  const uncertaintyIntegral = new Float64Array(
+  const detailIntegral = new Float64Array(
     integralStride * (mask.height + 1),
   )
   const foregroundIntegral = new Float64Array(
     integralStride * (mask.height + 1),
   )
+
+  // Score only transitions that locally contain both foreground and
+  // background. Internal uncertainty (reflections, eyes, texture) is excluded,
+  // while soft, irregular hair and fur boundaries receive the strongest weight.
   for (let y = 0; y < mask.height; y += 1) {
-    let uncertaintyRow = 0
+    let detailRow = 0
     let foregroundRow = 0
     for (let x = 0; x < mask.width; x += 1) {
-      const alpha = mask.data[y * mask.width + x]
-      uncertaintyRow += Math.min(alpha, 255 - alpha) / 127.5
+      const index = y * mask.width + x
+      const alpha = mask.data[index]
+      let localMinimum = alpha
+      let localMaximum = alpha
+      for (
+        let neighborY = Math.max(0, y - 1);
+        neighborY <= Math.min(mask.height - 1, y + 1);
+        neighborY += 1
+      ) {
+        const neighborRow = neighborY * mask.width
+        for (
+          let neighborX = Math.max(0, x - 1);
+          neighborX <= Math.min(mask.width - 1, x + 1);
+          neighborX += 1
+        ) {
+          const neighbor = mask.data[neighborRow + neighborX]
+          localMinimum = Math.min(localMinimum, neighbor)
+          localMaximum = Math.max(localMaximum, neighbor)
+        }
+      }
+
+      let detail = 0
+      if (
+        localMinimum <= EDGE_BACKGROUND_THRESHOLD
+        && localMaximum >= EDGE_FOREGROUND_THRESHOLD
+      ) {
+        const transition = Math.min(alpha, 255 - alpha) / 127.5
+        const contrast = (localMaximum - localMinimum) / 255
+        detail = contrast * (0.25 + transition * 0.75)
+      }
+      detailRow += detail
       foregroundRow += alpha >= COMPONENT_THRESHOLD ? 1 : 0
       const target = (y + 1) * integralStride + x + 1
-      uncertaintyIntegral[target] = (
-        uncertaintyIntegral[target - integralStride] + uncertaintyRow
+      detailIntegral[target] = (
+        detailIntegral[target - integralStride] + detailRow
       )
       foregroundIntegral[target] = (
         foregroundIntegral[target - integralStride] + foregroundRow
@@ -599,18 +637,19 @@ function findUncertaintyRefinementLayers(
     }
   }
 
-  const maximumLeft = mask.width - cropEdge
-  const maximumTop = mask.height - cropEdge
+  const maximumLeft = mask.width - tileEdge
+  const maximumTop = mask.height - tileEdge
   const stride = Math.max(
     8,
-    Math.round(cropEdge * UNCERTAINTY_CROP_STRIDE_FRACTION),
+    Math.round(tileEdge * EDGE_TILE_STRIDE_FRACTION),
   )
-  const windowArea = cropEdge * cropEdge
+  const tileArea = tileEdge * tileEdge
   const candidates: Array<SourceRect & { score: number }> = []
+  let maximumDetailDensity = 0
   for (const top of scanPositions(maximumTop, stride)) {
     for (const left of scanPositions(maximumLeft, stride)) {
-      const right = left + cropEdge
-      const bottom = top + cropEdge
+      const right = left + tileEdge
+      const bottom = top + tileEdge
       const foregroundCoverage = summedArea(
         foregroundIntegral,
         integralStride,
@@ -618,61 +657,68 @@ function findUncertaintyRefinementLayers(
         top,
         right,
         bottom,
-      ) / windowArea
+      ) / tileArea
       if (
-        foregroundCoverage < UNCERTAINTY_MIN_FOREGROUND_COVERAGE
-        || foregroundCoverage > UNCERTAINTY_MAX_FOREGROUND_COVERAGE
+        foregroundCoverage < EDGE_TILE_MIN_FOREGROUND_COVERAGE
+        || foregroundCoverage > EDGE_TILE_MAX_FOREGROUND_COVERAGE
       ) continue
 
-      const uncertainty = summedArea(
-        uncertaintyIntegral,
+      const boundaryDetail = summedArea(
+        detailIntegral,
         integralStride,
         left,
         top,
         right,
         bottom,
       )
-      if (uncertainty / windowArea < UNCERTAINTY_MIN_DENSITY) continue
+      const detailDensity = boundaryDetail / tileArea
+      maximumDetailDensity = Math.max(
+        maximumDetailDensity,
+        detailDensity,
+      )
+      if (detailDensity < EDGE_TILE_MIN_DETAIL_DENSITY) continue
 
-      // Fine hair and fur are usually concentrated around the upper subject,
-      // while coverage keeps empty background and solid interiors out.
-      const centerY = top + cropEdge / 2
-      const upperSubjectBias = 1.18 - 0.18 * centerY / mask.height
-      const coverageWeight = 0.8 + Math.min(0.4, foregroundCoverage)
+      const centerY = top + tileEdge / 2
+      const upperSubjectBias = 1.16 - 0.16 * centerY / mask.height
       candidates.push({
         left,
         top,
-        width:cropEdge,
-        height:cropEdge,
-        score:uncertainty * upperSubjectBias * coverageWeight,
+        width:tileEdge,
+        height:tileEdge,
+        score:boundaryDetail * upperSubjectBias,
       })
     }
   }
+  if (maximumDetailDensity < EDGE_TILE_TRIGGER_DENSITY) return []
+  const targetTileCount = maximumDetailDensity
+      >= EDGE_TILE_HIGH_DETAIL_DENSITY
+    ? 4
+    : maximumDetailDensity >= EDGE_TILE_MEDIUM_DETAIL_DENSITY
+      ? 3
+      : 2
 
   const selected: SourceRect[] = []
   for (const candidate of candidates.sort((a, b) => b.score - a.score)) {
     if (
       selected.some(
-        existing => rectOverlap(existing, candidate) > UNCERTAINTY_MAX_OVERLAP,
+        existing => rectOverlap(existing, candidate) > EDGE_TILE_MAX_OVERLAP,
       )
     ) continue
     selected.push(candidate)
-    if (selected.length >= MAX_UNCERTAINTY_REFINEMENT_PASSES) break
+    if (
+      selected.length
+      >= Math.min(MAX_EDGE_REFINEMENT_PASSES, targetTileCount)
+    ) break
   }
+  if (selected.length < 2) return []
 
   return selected
-    .map(candidate => {
-      const padding = Math.round(
-        Math.max(candidate.width, candidate.height)
-        * UNCERTAINTY_CROP_PADDING,
-      )
-      const left = Math.max(0, candidate.left - padding)
-      const top = Math.max(0, candidate.top - padding)
-      const right = Math.min(mask.width, candidate.left + candidate.width + padding)
-      const bottom = Math.min(
-        mask.height,
-        candidate.top + candidate.height + padding,
-      )
+    .map(tile => {
+      const padding = Math.round(tileEdge * EDGE_TILE_PADDING)
+      const left = Math.max(0, tile.left - padding)
+      const top = Math.max(0, tile.top - padding)
+      const right = Math.min(mask.width, tile.left + tile.width + padding)
+      const bottom = Math.min(mask.height, tile.top + tile.height + padding)
       const source = {
         left:Math.floor(left / mask.width * imageWidth),
         top:Math.floor(top / mask.height * imageHeight),
@@ -681,7 +727,7 @@ function findUncertaintyRefinementLayers(
         height:Math.ceil(bottom / mask.height * imageHeight)
           - Math.floor(top / mask.height * imageHeight),
       }
-      return { source, detail:'uncertainty' as const }
+      return { source, detail:'edge' as const }
     })
     .filter(layer => {
       const resolutionGain = Math.max(imageWidth, imageHeight)
@@ -689,7 +735,7 @@ function findUncertaintyRefinementLayers(
       return (
         layer.source.width >= 2
         && layer.source.height >= 2
-        && resolutionGain >= 1.2
+        && resolutionGain >= 1.5
       )
     })
 }
@@ -990,10 +1036,9 @@ function rasterizeMask(
         continue
       }
 
-      // A refinement crop has more spatial detail, but less scene context.
-      // Let it reshape only pixels where the preceding matte is uncertain.
-      // This prevents a tight pet/head crop from turning a confidently removed
-      // background object into a solid rectangular foreground patch.
+      // Tight refinement crops have more useful pixels but less scene context.
+      // Restrict them to reshaping an uncertain preceding matte, so a crop can
+      // resolve strands without inventing solid rectangular foreground.
       const prior = alpha[outputIndex]
       const priorUncertainty = (
         1 - Math.abs(prior - 127.5) / 127.5
@@ -1595,15 +1640,12 @@ function applyFullResolutionAlpha(
     decontaminationRadius,
   )
 
-  // Dedicated head crops carry substantially more strand information than the
-  // broad subject pass. Uncertainty crops do the same for fur and other fine
-  // subject edges, without requiring a human-head detection.
+  // Tight head and boundary crops carry substantially more strand information
+  // than the broad subject pass. Keep their partial alpha instead of applying
+  // the aggressive curve used for ordinary object contours.
   const fineDetailZones = layers
     .filter(
-      layer => (
-        layer.detail === 'hair'
-        || layer.detail === 'uncertainty'
-      ),
+      layer => layer.detail === 'hair' || layer.detail === 'edge',
     )
     .map(layer => ({
       left:layer.source.left,
@@ -1685,29 +1727,35 @@ workerScope.onmessage = async ({ data }: MessageEvent<WorkerRequest>) => {
           bitmap.width,
           bitmap.height,
         ).map(source => ({ source, detail:'person' as const }))
-    const uncertaintyLayers = findUncertaintyRefinementLayers(
+    const edgeLayers = findEdgeRefinementLayers(
       baseMask,
       bitmap.width,
       bitmap.height,
-    ).filter(
-      candidate => !structuralLayers.some(
-        existing => (
-          existing.detail === 'hair'
-          && rectOverlap(existing.source, candidate.source)
-            >= REFINEMENT_DUPLICATE_OVERLAP
-        ),
-      ),
+    ).filter(candidate => !structuralLayers.some(existing => {
+      const existingArea = existing.source.width * existing.source.height
+      const candidateArea = candidate.source.width * candidate.source.height
+      const areaRatio = Math.min(existingArea, candidateArea)
+        / Math.max(existingArea, candidateArea)
+      return (
+        areaRatio >= REFINEMENT_DUPLICATE_AREA_RATIO
+        && rectOverlap(existing.source, candidate.source)
+          >= REFINEMENT_DUPLICATE_OVERLAP
+      )
+    }))
+    const structuralBudget = Math.max(
+      0,
+      MAX_TOTAL_REFINEMENT_PASSES - edgeLayers.length,
     )
     const refinementLayers = [
-      ...structuralLayers,
-      ...uncertaintyLayers,
-    ].slice(0, MAX_TOTAL_REFINEMENT_PASSES)
+      ...structuralLayers.slice(0, structuralBudget),
+      ...edgeLayers,
+    ]
     for (let index = 0; index < refinementLayers.length; index += 1) {
       const refinementLayer = refinementLayers[index]
       const stage = refinementLayer.detail === 'hair'
         ? 'Refining hair and upper-body gaps'
-        : refinementLayer.detail === 'uncertainty'
-          ? 'Refining fine subject edges'
+        : refinementLayer.detail === 'edge'
+          ? 'Refining high-quality hair and fur edges'
           : `Refining subject ${index + 1} of ${refinementLayers.length}`
       report(
         data.id,
