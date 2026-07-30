@@ -14,6 +14,14 @@ type WorkerRequest = {
 
 const workerScope = self as unknown as DedicatedWorkerGlobalScope
 const MODEL_ID = 'studioludens/birefnet-lite-512'
+const MODEL_FILE_NAME = 'model_fp16.onnx'
+const MODEL_FILE_SIZE = 98_484_532
+const MODEL_FILE_PARTS = [
+  'model_fp16.onnx.part-0',
+  'model_fp16.onnx.part-1',
+  'model_fp16.onnx.part-2',
+  'model_fp16.onnx.part-3',
+] as const
 const MAX_INFERENCE_EDGE = 512
 const COMPONENT_THRESHOLD = 24
 const REFINEMENT_PADDING = 0.14
@@ -135,6 +143,54 @@ env.allowLocalModels = true
 env.useBrowserCache = false
 env.localModelPath = new URL('/models/', workerScope.location.href).href
 if (env.backends.onnx.wasm) env.backends.onnx.wasm.numThreads = 1
+
+// Keep the local model in repository-friendly chunks while presenting the
+// single ONNX response expected by Transformers.js. The parts are streamed in
+// order, so loading does not require a second full-size in-memory copy.
+const nativeFetch = workerScope.fetch.bind(workerScope)
+workerScope.fetch = (async (
+  input: RequestInfo | URL,
+  init?: RequestInit,
+) => {
+  const requestedUrl = new URL(
+    input instanceof Request ? input.url : input.toString(),
+    workerScope.location.href,
+  )
+  if (!requestedUrl.pathname.endsWith(`/${MODEL_FILE_NAME}`)) {
+    return nativeFetch(input, init)
+  }
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      try {
+        for (const part of MODEL_FILE_PARTS) {
+          const partUrl = new URL(part, requestedUrl)
+          const response = await nativeFetch(partUrl)
+          if (!response.ok || !response.body) {
+            throw new Error(
+              `Unable to load background-removal model part ${part}.`,
+            )
+          }
+          const reader = response.body.getReader()
+          while (true) {
+            const { value, done } = await reader.read()
+            if (done) break
+            controller.enqueue(value)
+          }
+        }
+        controller.close()
+      } catch (error) {
+        controller.error(error)
+      }
+    },
+  })
+  return new Response(stream, {
+    headers: {
+      'Content-Length':String(MODEL_FILE_SIZE),
+      'Content-Type':'application/octet-stream',
+    },
+  })
+}) as typeof fetch
 
 function report(id: string, progress: number, stage: string) {
   workerScope.postMessage({
