@@ -80,18 +80,17 @@ const MIN_ZOOM = 1;
 const MAX_ZOOM = 8;
 const UNDO_LIMIT = 12;
 const UNDO_TILE_SIZE = 128;
-const MAGIC_CANDIDATE_THRESHOLD = 48;
-const MAGIC_PAINTED_CONFIDENCE_THRESHOLD = 96;
-const MAGIC_EDGE_CANDIDATE_THRESHOLD = 24;
 const MAGIC_MASK_ALPHA_THRESHOLD = 8;
-const MAGIC_GROWTH_RADIUS_SCALE = 1.4;
-const MAGIC_EDGE_EXPANSION_PASSES = 1;
-const MAGIC_MIN_ALPHA_TOLERANCE = 40;
-const MAGIC_MAX_ALPHA_TOLERANCE = 104;
-const MAGIC_MIN_COLOR_TOLERANCE = 64;
-const MAGIC_MAX_COLOR_TOLERANCE = 128;
-const MAGIC_LOCAL_EDGE_COLOR_TOLERANCE = 96;
-const MAGIC_LOCAL_EDGE_ALPHA_TOLERANCE = 72;
+const MAGIC_GROWTH_RADIUS_SCALE = 2.75;
+const MAGIC_SAMPLE_CORE_SCALE = 0.36;
+const MAGIC_MIN_ALPHA_TOLERANCE = 28;
+const MAGIC_MAX_ALPHA_TOLERANCE = 72;
+const MAGIC_MIN_COLOR_TOLERANCE = 32;
+const MAGIC_MAX_COLOR_TOLERANCE = 80;
+const MAGIC_MIN_MODEL_TOLERANCE = 48;
+const MAGIC_MAX_MODEL_TOLERANCE = 112;
+const MAGIC_LOCAL_EDGE_COLOR_TOLERANCE = 48;
+const MAGIC_LOCAL_EDGE_ALPHA_TOLERANCE = 48;
 
 function loadImage(blob: Blob): Promise<LoadedImage> {
   return new Promise((resolve, reject) => {
@@ -574,124 +573,152 @@ export function RefineEditor({
         analysisWidth,
         analysisHeight,
       ).data;
-      const growthCanvas = document.createElement("canvas");
-      growthCanvas.width = analysisWidth;
-      growthCanvas.height = analysisHeight;
-      const growthContext = growthCanvas.getContext(
-        "2d",
-        { willReadFrequently:true },
-      );
-      if (!growthContext) {
-        throw new Error("Unable to constrain the AI selection.");
-      }
-      growthContext.fillStyle = "#fff";
-      for (const point of analysisPaintPoints) {
-        growthContext.beginPath();
-        growthContext.arc(
-          point.x,
-          point.y,
-          point.radius * MAGIC_GROWTH_RADIUS_SCALE,
-          0,
-          Math.PI * 2,
-        );
-        growthContext.fill();
-      }
-      const growthPixels = growthContext.getImageData(
-        0,
-        0,
-        analysisWidth,
-        analysisHeight,
-      ).data;
       const pixelCount = analysisWidth * analysisHeight;
-      let paintedModelAlpha = 0;
-      let paintedVisibleAlpha = 0;
-      let paintedRed = 0;
-      let paintedGreen = 0;
-      let paintedBlue = 0;
-      let paintedAlphaSquared = 0;
-      let paintedRedSquared = 0;
-      let paintedGreenSquared = 0;
-      let paintedBlueSquared = 0;
-      let paintedCount = 0;
-      for (let index = 0; index < pixelCount; index += 1) {
-        const offset = index * 4;
-        if (
-          samplePixels[offset + 3] > 24
-          && visiblePixels[offset + 3] > 4
-        ) {
-          const red = visiblePixels[offset];
-          const green = visiblePixels[offset + 1];
-          const blue = visiblePixels[offset + 2];
-          const alpha = visiblePixels[offset + 3];
-          paintedModelAlpha += resultPixels[index];
-          paintedVisibleAlpha += alpha;
-          paintedRed += red;
-          paintedGreen += green;
-          paintedBlue += blue;
-          paintedAlphaSquared += alpha * alpha;
-          paintedRedSquared += red * red;
-          paintedGreenSquared += green * green;
-          paintedBlueSquared += blue * blue;
-          paintedCount += 1;
+      const pointSamples = analysisSeeds.map(seed => {
+        const radius = Math.max(
+          1,
+          seed.radius * MAGIC_SAMPLE_CORE_SCALE,
+        );
+        const sampleLeft = Math.max(0, Math.floor(seed.x - radius));
+        const sampleTop = Math.max(0, Math.floor(seed.y - radius));
+        const sampleRight = Math.min(
+          analysisWidth - 1,
+          Math.ceil(seed.x + radius),
+        );
+        const sampleBottom = Math.min(
+          analysisHeight - 1,
+          Math.ceil(seed.y + radius),
+        );
+        let red = 0;
+        let green = 0;
+        let blue = 0;
+        let alpha = 0;
+        let model = 0;
+        let redSquared = 0;
+        let greenSquared = 0;
+        let blueSquared = 0;
+        let alphaSquared = 0;
+        let modelSquared = 0;
+        let count = 0;
+        for (let y = sampleTop; y <= sampleBottom; y += 1) {
+          const normalizedY = (y + 0.5 - seed.y) / radius;
+          for (let x = sampleLeft; x <= sampleRight; x += 1) {
+            const normalizedX = (x + 0.5 - seed.x) / radius;
+            if (
+              normalizedX * normalizedX + normalizedY * normalizedY > 1
+            ) continue;
+            const index = y * analysisWidth + x;
+            const offset = index * 4;
+            if (visiblePixels[offset + 3] <= 4) continue;
+            const pixelRed = visiblePixels[offset];
+            const pixelGreen = visiblePixels[offset + 1];
+            const pixelBlue = visiblePixels[offset + 2];
+            const pixelAlpha = visiblePixels[offset + 3];
+            const pixelModel = resultPixels[index];
+            red += pixelRed;
+            green += pixelGreen;
+            blue += pixelBlue;
+            alpha += pixelAlpha;
+            model += pixelModel;
+            redSquared += pixelRed * pixelRed;
+            greenSquared += pixelGreen * pixelGreen;
+            blueSquared += pixelBlue * pixelBlue;
+            alphaSquared += pixelAlpha * pixelAlpha;
+            modelSquared += pixelModel * pixelModel;
+            count += 1;
+          }
         }
-      }
-      if (!paintedCount) {
-        for (let index = 0; index < pixelCount; index += 1) {
-          const offset = index * 4;
-          if (
-            paintPixels[offset + 3] <= 24
-            || visiblePixels[offset + 3] <= 4
-          ) continue;
-          const red = visiblePixels[offset];
-          const green = visiblePixels[offset + 1];
-          const blue = visiblePixels[offset + 2];
-          const alpha = visiblePixels[offset + 3];
-          paintedModelAlpha += resultPixels[index];
-          paintedVisibleAlpha += alpha;
-          paintedRed += red;
-          paintedGreen += green;
-          paintedBlue += blue;
-          paintedAlphaSquared += alpha * alpha;
-          paintedRedSquared += red * red;
-          paintedGreenSquared += green * green;
-          paintedBlueSquared += blue * blue;
-          paintedCount += 1;
-        }
-      }
-      if (!paintedCount) {
+        if (!count) return undefined;
+        const meanRed = red / count;
+        const meanGreen = green / count;
+        const meanBlue = blue / count;
+        const meanAlpha = alpha / count;
+        const meanModel = model / count;
+        const colorDeviation = Math.sqrt(Math.max(
+          0,
+          (
+            redSquared / count - meanRed * meanRed
+            + greenSquared / count - meanGreen * meanGreen
+            + blueSquared / count - meanBlue * meanBlue
+          ) / 3,
+        ));
+        const alphaDeviation = Math.sqrt(Math.max(
+          0,
+          alphaSquared / count - meanAlpha * meanAlpha,
+        ));
+        const modelDeviation = Math.sqrt(Math.max(
+          0,
+          modelSquared / count - meanModel * meanModel,
+        ));
+        const colorTolerance = clamp(
+          30 + colorDeviation * 1.8,
+          MAGIC_MIN_COLOR_TOLERANCE,
+          MAGIC_MAX_COLOR_TOLERANCE,
+        );
+        return {
+          red:meanRed,
+          green:meanGreen,
+          blue:meanBlue,
+          alpha:meanAlpha,
+          model:meanModel,
+          colorToleranceSquared:colorTolerance * colorTolerance,
+          alphaTolerance:clamp(
+            24 + alphaDeviation * 1.8,
+            MAGIC_MIN_ALPHA_TOLERANCE,
+            MAGIC_MAX_ALPHA_TOLERANCE,
+          ),
+          modelTolerance:clamp(
+            40 + modelDeviation * 2,
+            MAGIC_MIN_MODEL_TOLERANCE,
+            MAGIC_MAX_MODEL_TOLERANCE,
+          ),
+        };
+      });
+      if (!pointSamples.some(Boolean)) {
         throw new Error("Paint over a visible area to create an AI selection.");
       }
-      const selectForeground =
-        paintedModelAlpha / paintedCount >= 127.5;
-      const meanVisibleAlpha = paintedVisibleAlpha / paintedCount;
-      const meanRed = paintedRed / paintedCount;
-      const meanGreen = paintedGreen / paintedCount;
-      const meanBlue = paintedBlue / paintedCount;
-      const alphaDeviation = Math.sqrt(Math.max(
-        0,
-        paintedAlphaSquared / paintedCount
-          - meanVisibleAlpha * meanVisibleAlpha,
-      ));
-      const colorDeviation = Math.sqrt(Math.max(
-        0,
-        (
-          paintedRedSquared / paintedCount - meanRed * meanRed
-          + paintedGreenSquared / paintedCount - meanGreen * meanGreen
-          + paintedBlueSquared / paintedCount - meanBlue * meanBlue
-        ) / 3,
-      ));
-      const alphaTolerance = clamp(
-        36 + alphaDeviation * 2.25,
-        MAGIC_MIN_ALPHA_TOLERANCE,
-        MAGIC_MAX_ALPHA_TOLERANCE,
-      );
-      const colorTolerance = clamp(
-        52 + colorDeviation * 2.4,
-        MAGIC_MIN_COLOR_TOLERANCE,
-        MAGIC_MAX_COLOR_TOLERANCE,
-      );
-      const colorToleranceSquared = colorTolerance * colorTolerance;
-      const aiCandidates = new Uint8Array(pixelCount);
+
+      const nearestPoint = new Int32Array(pixelCount);
+      nearestPoint.fill(-1);
+      const nearestDistance = new Float32Array(pixelCount);
+      nearestDistance.fill(Number.POSITIVE_INFINITY);
+      for (
+        let pointIndex = 0;
+        pointIndex < analysisPaintPoints.length;
+        pointIndex += 1
+      ) {
+        if (!pointSamples[pointIndex]) continue;
+        const point = analysisPaintPoints[pointIndex];
+        const radius = Math.max(
+          1,
+          point.radius * MAGIC_GROWTH_RADIUS_SCALE,
+        );
+        const growthLeft = Math.max(0, Math.floor(point.x - radius));
+        const growthTop = Math.max(0, Math.floor(point.y - radius));
+        const growthRight = Math.min(
+          analysisWidth - 1,
+          Math.ceil(point.x + radius),
+        );
+        const growthBottom = Math.min(
+          analysisHeight - 1,
+          Math.ceil(point.y + radius),
+        );
+        for (let y = growthTop; y <= growthBottom; y += 1) {
+          const normalizedY = (y + 0.5 - point.y) / radius;
+          for (let x = growthLeft; x <= growthRight; x += 1) {
+            const normalizedX = (x + 0.5 - point.x) / radius;
+            const distance = (
+              normalizedX * normalizedX + normalizedY * normalizedY
+            );
+            if (distance > 1) continue;
+            const index = y * analysisWidth + x;
+            if (distance >= nearestDistance[index]) continue;
+            nearestDistance[index] = distance;
+            nearestPoint[index] = pointIndex;
+          }
+        }
+      }
+
       const candidates = new Uint8Array(pixelCount);
       const selected = new Uint8Array(pixelCount);
       const queue = new Int32Array(pixelCount);
@@ -699,53 +726,41 @@ export function RefineEditor({
 
       for (let index = 0; index < pixelCount; index += 1) {
         const offset = index * 4;
-        const predicted = resultPixels[index];
-        const sideStrength = selectForeground
-          ? predicted
-          : 255 - predicted;
+        const pointIndex = nearestPoint[index];
+        if (pointIndex < 0 || visiblePixels[offset + 3] <= 4) continue;
+        const pointSample = pointSamples[pointIndex];
+        if (!pointSample) continue;
         const isPainted = paintPixels[offset + 3] > 24;
         const isSampledHint = samplePixels[offset + 3] > 24;
-        if (
-          visiblePixels[offset + 3] > 0
-          && growthPixels[offset + 3] > 24
-        ) {
-          if (sideStrength < MAGIC_EDGE_CANDIDATE_THRESHOLD) continue;
-          aiCandidates[index] = 1;
-          const redDifference = visiblePixels[offset] - meanRed;
-          const greenDifference = visiblePixels[offset + 1] - meanGreen;
-          const blueDifference = visiblePixels[offset + 2] - meanBlue;
-          const colorDistanceSquared = (
-            redDifference * redDifference
-            + greenDifference * greenDifference
-            + blueDifference * blueDifference
-          );
-          const appearanceMatches = (
-            Math.abs(
-              visiblePixels[offset + 3] - meanVisibleAlpha,
-            ) <= alphaTolerance
-            && colorDistanceSquared <= colorToleranceSquared
-          );
-          if (
-            sideStrength >= MAGIC_CANDIDATE_THRESHOLD
-            && (
-              appearanceMatches
-              || (
-                isPainted
-                && sideStrength >= MAGIC_PAINTED_CONFIDENCE_THRESHOLD
-              )
-            )
-          ) {
-            candidates[index] = 1;
-          }
-          if (
-            isSampledHint
-            && sideStrength >= MAGIC_CANDIDATE_THRESHOLD
-          ) {
-            candidates[index] = 1;
-            selected[index] = 1;
-            queue[write] = index;
-            write += 1;
-          }
+        const redDifference = visiblePixels[offset] - pointSample.red;
+        const greenDifference = (
+          visiblePixels[offset + 1] - pointSample.green
+        );
+        const blueDifference = (
+          visiblePixels[offset + 2] - pointSample.blue
+        );
+        const colorDistanceSquared = (
+          redDifference * redDifference
+          + greenDifference * greenDifference
+          + blueDifference * blueDifference
+        );
+        const appearanceMatches = (
+          colorDistanceSquared <= pointSample.colorToleranceSquared
+          && Math.abs(
+            visiblePixels[offset + 3] - pointSample.alpha,
+          ) <= pointSample.alphaTolerance
+          && Math.abs(
+            resultPixels[index] - pointSample.model,
+          ) <= pointSample.modelTolerance
+        );
+        if (isPainted || appearanceMatches) {
+          candidates[index] = 1;
+        }
+        if (isSampledHint) {
+          candidates[index] = 1;
+          selected[index] = 1;
+          queue[write] = index;
+          write += 1;
         }
       }
       if (!write) {
@@ -814,41 +829,6 @@ export function RefineEditor({
             candidates,
           );
         }
-      }
-
-      let frontierStart = 0;
-      for (
-        let pass = 0;
-        pass < MAGIC_EDGE_EXPANSION_PASSES && frontierStart < write;
-        pass += 1
-      ) {
-        const frontierEnd = write;
-        for (let read = frontierStart; read < frontierEnd; read += 1) {
-          const index = queue[read];
-          const x = index % analysisWidth;
-          const y = Math.floor(index / analysisWidth);
-          if (x > 0) {
-            addConnectedNeighbor(index, index - 1, aiCandidates);
-          }
-          if (x < analysisWidth - 1) {
-            addConnectedNeighbor(index, index + 1, aiCandidates);
-          }
-          if (y > 0) {
-            addConnectedNeighbor(
-              index,
-              index - analysisWidth,
-              aiCandidates,
-            );
-          }
-          if (y < analysisHeight - 1) {
-            addConnectedNeighbor(
-              index,
-              index + analysisWidth,
-              aiCandidates,
-            );
-          }
-        }
-        frontierStart = frontierEnd;
       }
 
       const preview = document.createElement("canvas");
