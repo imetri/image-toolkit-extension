@@ -80,7 +80,8 @@ const MIN_ZOOM = 1;
 const MAX_ZOOM = 8;
 const UNDO_LIMIT = 12;
 const UNDO_TILE_SIZE = 128;
-const MAGIC_MASK_ALPHA_THRESHOLD = 8;
+const MAGIC_MASK_ALPHA_THRESHOLD = 128;
+const MAGIC_HINT_CORE_RADIUS_SCALE = 0.26;
 const MAGIC_GROWTH_RADIUS_SCALE = 2.75;
 const MAGIC_SAMPLE_CORE_SCALE = 0.36;
 const MAGIC_MIN_ALPHA_TOLERANCE = 28;
@@ -452,6 +453,12 @@ export function RefineEditor({
       analysisWidth,
       analysisHeight,
     );
+    const sourcePixels = cropContext.getImageData(
+      0,
+      0,
+      analysisWidth,
+      analysisHeight,
+    ).data;
 
     magicAbortRef.current?.abort();
     const controller = new AbortController();
@@ -465,7 +472,10 @@ export function RefineEditor({
       const analysisSeeds = points.map(point => ({
         x: (point.x - left) * analysisScale,
         y: (point.y - top) * analysisScale,
-        radius: Math.max(1, point.radius * analysisScale * 0.58),
+        radius: Math.max(
+          1,
+          point.radius * analysisScale * MAGIC_HINT_CORE_RADIUS_SCALE,
+        ),
       }));
       const analysisPaintPoints = points.map(point => ({
         x: (point.x - left) * analysisScale,
@@ -545,34 +555,6 @@ export function RefineEditor({
         analysisWidth,
         analysisHeight,
       ).data;
-      const paintCanvas = document.createElement("canvas");
-      paintCanvas.width = analysisWidth;
-      paintCanvas.height = analysisHeight;
-      const paintContext = paintCanvas.getContext(
-        "2d",
-        { willReadFrequently:true },
-      );
-      if (!paintContext) {
-        throw new Error("Unable to preserve the painted selection.");
-      }
-      paintContext.fillStyle = "#fff";
-      for (const point of analysisPaintPoints) {
-        paintContext.beginPath();
-        paintContext.arc(
-          point.x,
-          point.y,
-          point.radius,
-          0,
-          Math.PI * 2,
-        );
-        paintContext.fill();
-      }
-      const paintPixels = paintContext.getImageData(
-        0,
-        0,
-        analysisWidth,
-        analysisHeight,
-      ).data;
       const pixelCount = analysisWidth * analysisHeight;
       const pointSamples = analysisSeeds.map(seed => {
         const radius = Math.max(
@@ -610,9 +592,9 @@ export function RefineEditor({
             const index = y * analysisWidth + x;
             const offset = index * 4;
             if (visiblePixels[offset + 3] <= 4) continue;
-            const pixelRed = visiblePixels[offset];
-            const pixelGreen = visiblePixels[offset + 1];
-            const pixelBlue = visiblePixels[offset + 2];
+            const pixelRed = sourcePixels[offset];
+            const pixelGreen = sourcePixels[offset + 1];
+            const pixelBlue = sourcePixels[offset + 2];
             const pixelAlpha = visiblePixels[offset + 3];
             const pixelModel = resultPixels[index];
             red += pixelRed;
@@ -730,14 +712,13 @@ export function RefineEditor({
         if (pointIndex < 0 || visiblePixels[offset + 3] <= 4) continue;
         const pointSample = pointSamples[pointIndex];
         if (!pointSample) continue;
-        const isPainted = paintPixels[offset + 3] > 24;
         const isSampledHint = samplePixels[offset + 3] > 24;
-        const redDifference = visiblePixels[offset] - pointSample.red;
+        const redDifference = sourcePixels[offset] - pointSample.red;
         const greenDifference = (
-          visiblePixels[offset + 1] - pointSample.green
+          sourcePixels[offset + 1] - pointSample.green
         );
         const blueDifference = (
-          visiblePixels[offset + 2] - pointSample.blue
+          sourcePixels[offset + 2] - pointSample.blue
         );
         const colorDistanceSquared = (
           redDifference * redDifference
@@ -753,10 +734,10 @@ export function RefineEditor({
             resultPixels[index] - pointSample.model,
           ) <= pointSample.modelTolerance
         );
-        if (isPainted || appearanceMatches) {
+        if (appearanceMatches) {
           candidates[index] = 1;
         }
-        if (isSampledHint) {
+        if (isSampledHint && appearanceMatches) {
           candidates[index] = 1;
           selected[index] = 1;
           queue[write] = index;
@@ -780,15 +761,15 @@ export function RefineEditor({
         const currentOffset = current * 4;
         const neighborOffset = neighbor * 4;
         const redDifference = (
-          visiblePixels[currentOffset] - visiblePixels[neighborOffset]
+          sourcePixels[currentOffset] - sourcePixels[neighborOffset]
         );
         const greenDifference = (
-          visiblePixels[currentOffset + 1]
-          - visiblePixels[neighborOffset + 1]
+          sourcePixels[currentOffset + 1]
+          - sourcePixels[neighborOffset + 1]
         );
         const blueDifference = (
-          visiblePixels[currentOffset + 2]
-          - visiblePixels[neighborOffset + 2]
+          sourcePixels[currentOffset + 2]
+          - sourcePixels[neighborOffset + 2]
         );
         if (
           redDifference * redDifference
@@ -868,6 +849,12 @@ export function RefineEditor({
         cropWidth,
         cropHeight,
       );
+      const fullResolutionVisible = workContext.getImageData(
+        left,
+        top,
+        cropWidth,
+        cropHeight,
+      ).data;
       for (
         let offset = 3;
         offset < fullResolutionMask.data.length;
@@ -875,6 +862,7 @@ export function RefineEditor({
       ) {
         fullResolutionMask.data[offset] =
           fullResolutionMask.data[offset] >= MAGIC_MASK_ALPHA_THRESHOLD
+            && fullResolutionVisible[offset] > 4
             ? 255
             : 0;
       }
