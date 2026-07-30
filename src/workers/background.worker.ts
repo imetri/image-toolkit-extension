@@ -97,6 +97,7 @@ const COLOR_ISLAND_FEATHER_RADIUS = 2
 const MAGIC_SELECTION_THRESHOLD = 32
 const MAGIC_COMPONENT_PADDING = 0.1
 const MAGIC_HINT_PADDING_SCALE = 2.5
+const MAGIC_MAX_COMPONENT_TO_HINT_AREA_RATIO = 4
 const ALPHA_FILTER_RADIUS = 2
 const ALPHA_FILTER_PASSES = 2
 const MAX_COLOR_EDGE_RADIUS = 24
@@ -2232,7 +2233,15 @@ workerScope.onmessage = async ({ data }: MessageEvent<WorkerRequest>) => {
         bitmap.height,
         data.seeds,
       )
-      const focusRect = seededComponent?.selectForeground
+      const componentArea = seededComponent
+        ? seededComponent.source.width * seededComponent.source.height
+        : Number.POSITIVE_INFINITY
+      const hintArea = hintRect.width * hintRect.height
+      const focusRect = (
+        seededComponent?.selectForeground
+        && componentArea
+          <= hintArea * MAGIC_MAX_COMPONENT_TO_HINT_AREA_RATIO
+      )
         ? seededComponent.source
         : hintRect
       refinementLayers = refinementLayers.filter(

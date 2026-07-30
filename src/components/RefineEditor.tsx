@@ -81,7 +81,16 @@ const MAX_ZOOM = 8;
 const UNDO_LIMIT = 12;
 const UNDO_TILE_SIZE = 128;
 const MAGIC_CANDIDATE_THRESHOLD = 32;
+const MAGIC_EDGE_CANDIDATE_THRESHOLD = 12;
 const MAGIC_MASK_ALPHA_THRESHOLD = 8;
+const MAGIC_GROWTH_RADIUS_SCALE = 3;
+const MAGIC_EDGE_EXPANSION_PASSES = 3;
+const MAGIC_MIN_ALPHA_TOLERANCE = 40;
+const MAGIC_MAX_ALPHA_TOLERANCE = 128;
+const MAGIC_MIN_COLOR_TOLERANCE = 64;
+const MAGIC_MAX_COLOR_TOLERANCE = 168;
+const MAGIC_LOCAL_EDGE_COLOR_TOLERANCE = 120;
+const MAGIC_LOCAL_EDGE_ALPHA_TOLERANCE = 96;
 
 function loadImage(blob: Blob): Promise<LoadedImage> {
   return new Promise((resolve, reject) => {
@@ -531,8 +540,44 @@ export function RefineEditor({
         analysisWidth,
         analysisHeight,
       ).data;
+      const growthCanvas = document.createElement("canvas");
+      growthCanvas.width = analysisWidth;
+      growthCanvas.height = analysisHeight;
+      const growthContext = growthCanvas.getContext(
+        "2d",
+        { willReadFrequently:true },
+      );
+      if (!growthContext) {
+        throw new Error("Unable to constrain the AI selection.");
+      }
+      growthContext.fillStyle = "#fff";
+      for (const seed of analysisSeeds) {
+        growthContext.beginPath();
+        growthContext.arc(
+          seed.x,
+          seed.y,
+          seed.radius * MAGIC_GROWTH_RADIUS_SCALE,
+          0,
+          Math.PI * 2,
+        );
+        growthContext.fill();
+      }
+      const growthPixels = growthContext.getImageData(
+        0,
+        0,
+        analysisWidth,
+        analysisHeight,
+      ).data;
       const pixelCount = analysisWidth * analysisHeight;
-      let paintedAlpha = 0;
+      let paintedModelAlpha = 0;
+      let paintedVisibleAlpha = 0;
+      let paintedRed = 0;
+      let paintedGreen = 0;
+      let paintedBlue = 0;
+      let paintedAlphaSquared = 0;
+      let paintedRedSquared = 0;
+      let paintedGreenSquared = 0;
+      let paintedBlueSquared = 0;
       let paintedCount = 0;
       for (let index = 0; index < pixelCount; index += 1) {
         const offset = index * 4;
@@ -540,14 +585,56 @@ export function RefineEditor({
           seedPixels[offset + 3] > 24
           && visiblePixels[offset + 3] > 4
         ) {
-          paintedAlpha += resultPixels[index];
+          const red = visiblePixels[offset];
+          const green = visiblePixels[offset + 1];
+          const blue = visiblePixels[offset + 2];
+          const alpha = visiblePixels[offset + 3];
+          paintedModelAlpha += resultPixels[index];
+          paintedVisibleAlpha += alpha;
+          paintedRed += red;
+          paintedGreen += green;
+          paintedBlue += blue;
+          paintedAlphaSquared += alpha * alpha;
+          paintedRedSquared += red * red;
+          paintedGreenSquared += green * green;
+          paintedBlueSquared += blue * blue;
           paintedCount += 1;
         }
       }
       if (!paintedCount) {
         throw new Error("Paint over a visible area to create an AI selection.");
       }
-      const selectForeground = paintedAlpha / paintedCount >= 127.5;
+      const selectForeground =
+        paintedModelAlpha / paintedCount >= 127.5;
+      const meanVisibleAlpha = paintedVisibleAlpha / paintedCount;
+      const meanRed = paintedRed / paintedCount;
+      const meanGreen = paintedGreen / paintedCount;
+      const meanBlue = paintedBlue / paintedCount;
+      const alphaDeviation = Math.sqrt(Math.max(
+        0,
+        paintedAlphaSquared / paintedCount
+          - meanVisibleAlpha * meanVisibleAlpha,
+      ));
+      const colorDeviation = Math.sqrt(Math.max(
+        0,
+        (
+          paintedRedSquared / paintedCount - meanRed * meanRed
+          + paintedGreenSquared / paintedCount - meanGreen * meanGreen
+          + paintedBlueSquared / paintedCount - meanBlue * meanBlue
+        ) / 3,
+      ));
+      const alphaTolerance = clamp(
+        36 + alphaDeviation * 2.25,
+        MAGIC_MIN_ALPHA_TOLERANCE,
+        MAGIC_MAX_ALPHA_TOLERANCE,
+      );
+      const colorTolerance = clamp(
+        52 + colorDeviation * 2.4,
+        MAGIC_MIN_COLOR_TOLERANCE,
+        MAGIC_MAX_COLOR_TOLERANCE,
+      );
+      const colorToleranceSquared = colorTolerance * colorTolerance;
+      const aiCandidates = new Uint8Array(pixelCount);
       const candidates = new Uint8Array(pixelCount);
       const selected = new Uint8Array(pixelCount);
       const queue = new Int32Array(pixelCount);
@@ -559,12 +646,34 @@ export function RefineEditor({
         const sideStrength = selectForeground
           ? predicted
           : 255 - predicted;
+        const isSeed = seedPixels[offset + 3] > 24;
         if (
           visiblePixels[offset + 3] > 0
-          && sideStrength >= MAGIC_CANDIDATE_THRESHOLD
+          && growthPixels[offset + 3] > 24
+          && sideStrength >= MAGIC_EDGE_CANDIDATE_THRESHOLD
         ) {
-          candidates[index] = 1;
-          if (seedPixels[offset + 3] > 24) {
+          aiCandidates[index] = 1;
+          const redDifference = visiblePixels[offset] - meanRed;
+          const greenDifference = visiblePixels[offset + 1] - meanGreen;
+          const blueDifference = visiblePixels[offset + 2] - meanBlue;
+          const colorDistanceSquared = (
+            redDifference * redDifference
+            + greenDifference * greenDifference
+            + blueDifference * blueDifference
+          );
+          const appearanceMatches = (
+            Math.abs(
+              visiblePixels[offset + 3] - meanVisibleAlpha,
+            ) <= alphaTolerance
+            && colorDistanceSquared <= colorToleranceSquared
+          );
+          if (
+            sideStrength >= MAGIC_CANDIDATE_THRESHOLD
+            && (isSeed || appearanceMatches)
+          ) {
+            candidates[index] = 1;
+          }
+          if (isSeed) {
             selected[index] = 1;
             queue[write] = index;
             write += 1;
@@ -576,43 +685,102 @@ export function RefineEditor({
           "The AI could not find a removable region under that hint.",
         );
       }
+      const localColorToleranceSquared =
+        MAGIC_LOCAL_EDGE_COLOR_TOLERANCE
+        * MAGIC_LOCAL_EDGE_COLOR_TOLERANCE;
+      const addConnectedNeighbor = (
+        current: number,
+        neighbor: number,
+        allowed: Uint8Array,
+      ) => {
+        if (selected[neighbor] || !allowed[neighbor]) return;
+        const currentOffset = current * 4;
+        const neighborOffset = neighbor * 4;
+        const redDifference = (
+          visiblePixels[currentOffset] - visiblePixels[neighborOffset]
+        );
+        const greenDifference = (
+          visiblePixels[currentOffset + 1]
+          - visiblePixels[neighborOffset + 1]
+        );
+        const blueDifference = (
+          visiblePixels[currentOffset + 2]
+          - visiblePixels[neighborOffset + 2]
+        );
+        if (
+          redDifference * redDifference
+            + greenDifference * greenDifference
+            + blueDifference * blueDifference
+            > localColorToleranceSquared
+          || Math.abs(
+            visiblePixels[currentOffset + 3]
+              - visiblePixels[neighborOffset + 3],
+          ) > MAGIC_LOCAL_EDGE_ALPHA_TOLERANCE
+        ) return;
+        selected[neighbor] = 1;
+        queue[write] = neighbor;
+        write += 1;
+      };
 
       for (let read = 0; read < write; read += 1) {
         const index = queue[read];
         const x = index % analysisWidth;
         const y = Math.floor(index / analysisWidth);
         if (x > 0) {
-          const neighbor = index - 1;
-          if (!selected[neighbor] && candidates[neighbor]) {
-            selected[neighbor] = 1;
-            queue[write] = neighbor;
-            write += 1;
-          }
+          addConnectedNeighbor(index, index - 1, candidates);
         }
         if (x < analysisWidth - 1) {
-          const neighbor = index + 1;
-          if (!selected[neighbor] && candidates[neighbor]) {
-            selected[neighbor] = 1;
-            queue[write] = neighbor;
-            write += 1;
-          }
+          addConnectedNeighbor(index, index + 1, candidates);
         }
         if (y > 0) {
-          const neighbor = index - analysisWidth;
-          if (!selected[neighbor] && candidates[neighbor]) {
-            selected[neighbor] = 1;
-            queue[write] = neighbor;
-            write += 1;
-          }
+          addConnectedNeighbor(
+            index,
+            index - analysisWidth,
+            candidates,
+          );
         }
         if (y < analysisHeight - 1) {
-          const neighbor = index + analysisWidth;
-          if (!selected[neighbor] && candidates[neighbor]) {
-            selected[neighbor] = 1;
-            queue[write] = neighbor;
-            write += 1;
+          addConnectedNeighbor(
+            index,
+            index + analysisWidth,
+            candidates,
+          );
+        }
+      }
+
+      let frontierStart = 0;
+      for (
+        let pass = 0;
+        pass < MAGIC_EDGE_EXPANSION_PASSES && frontierStart < write;
+        pass += 1
+      ) {
+        const frontierEnd = write;
+        for (let read = frontierStart; read < frontierEnd; read += 1) {
+          const index = queue[read];
+          const x = index % analysisWidth;
+          const y = Math.floor(index / analysisWidth);
+          if (x > 0) {
+            addConnectedNeighbor(index, index - 1, aiCandidates);
+          }
+          if (x < analysisWidth - 1) {
+            addConnectedNeighbor(index, index + 1, aiCandidates);
+          }
+          if (y > 0) {
+            addConnectedNeighbor(
+              index,
+              index - analysisWidth,
+              aiCandidates,
+            );
+          }
+          if (y < analysisHeight - 1) {
+            addConnectedNeighbor(
+              index,
+              index + analysisWidth,
+              aiCandidates,
+            );
           }
         }
+        frontierStart = frontierEnd;
       }
 
       const preview = document.createElement("canvas");
