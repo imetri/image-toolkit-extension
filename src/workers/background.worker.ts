@@ -83,6 +83,11 @@ const COLOR_ISLAND_FEATHER_RADIUS = 2
 const ALPHA_FILTER_RADIUS = 2
 const ALPHA_FILTER_PASSES = 2
 const MAX_COLOR_EDGE_RADIUS = 24
+const DECONTAMINATION_BACKGROUND_ALPHA = 5
+const DECONTAMINATION_FOREGROUND_ALPHA = 250
+const DECONTAMINATION_MIN_SOLVE_ALPHA = 0.08
+const DECONTAMINATION_BACKGROUND_COLOR_TOLERANCE = 72
+const MAX_DECONTAMINATION_RADIUS = 16
 const DETACHED_ARTIFACT_THRESHOLD = 128
 const DETACHED_ARTIFACT_MAX_PRIMARY_FRACTION = 0.012
 const DETACHED_ARTIFACT_LOWER_FRACTION = 0.48
@@ -1492,16 +1497,40 @@ function decontaminateEdgeColors(
   height: number,
   radius: number,
 ) {
+  const backgroundIndices = new Int32Array(COLOR_EDGE_DIRECTIONS.length)
+  const backgroundDistances = new Float32Array(
+    COLOR_EDGE_DIRECTIONS.length,
+  )
+  const backgroundColor = new Float32Array(3)
+  const unmixedColor = new Float32Array(3)
+  const backgroundToleranceSquared = (
+    DECONTAMINATION_BACKGROUND_COLOR_TOLERANCE ** 2 * 3
+  )
+
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
       const index = y * width + x
       const currentAlpha = alpha[index]
-      if (currentAlpha <= 5 || currentAlpha >= 250) continue
+      if (
+        currentAlpha <= DECONTAMINATION_BACKGROUND_ALPHA
+        || currentAlpha >= DECONTAMINATION_FOREGROUND_ALPHA
+      ) continue
 
-      let bestIndex = -1
-      let bestAlpha = currentAlpha
-      let bestDistance = Number.POSITIVE_INFINITY
-      for (const [directionX, directionY] of COLOR_EDGE_DIRECTIONS) {
+      backgroundIndices.fill(-1)
+      let backgroundSampleCount = 0
+      let nearestBackgroundIndex = -1
+      let nearestBackgroundDistance = Number.POSITIVE_INFINITY
+      let interiorIndex = -1
+      let interiorAlpha = currentAlpha
+      let interiorDistance = Number.POSITIVE_INFINITY
+      for (
+        let directionIndex = 0;
+        directionIndex < COLOR_EDGE_DIRECTIONS.length;
+        directionIndex += 1
+      ) {
+        const [directionX, directionY] = COLOR_EDGE_DIRECTIONS[
+          directionIndex
+        ]
         for (let step = 1; step <= radius; step += 1) {
           const neighborX = x + directionX * step
           const neighborY = y + directionY * step
@@ -1518,29 +1547,174 @@ function decontaminateEdgeColors(
             directionX !== 0 && directionY !== 0 ? Math.SQRT2 : 1
           )
           if (
-            neighborAlpha > bestAlpha
-            || (neighborAlpha === bestAlpha && distance < bestDistance)
+            neighborAlpha > interiorAlpha
+            || (
+              neighborAlpha === interiorAlpha
+              && distance < interiorDistance
+            )
           ) {
-            bestAlpha = neighborAlpha
-            bestDistance = distance
-            bestIndex = neighborIndex
+            interiorAlpha = neighborAlpha
+            interiorDistance = distance
+            interiorIndex = neighborIndex
           }
-          if (neighborAlpha >= 250) break
+          if (
+            neighborAlpha <= DECONTAMINATION_BACKGROUND_ALPHA
+          ) {
+            backgroundIndices[directionIndex] = neighborIndex
+            backgroundDistances[directionIndex] = distance
+            backgroundSampleCount += 1
+            if (distance < nearestBackgroundDistance) {
+              nearestBackgroundDistance = distance
+              nearestBackgroundIndex = neighborIndex
+            }
+            break
+          }
+          if (
+            neighborAlpha >= DECONTAMINATION_FOREGROUND_ALPHA
+          ) break
         }
       }
-      if (bestIndex < 0 || bestAlpha < currentAlpha + 12) continue
+      if (
+        interiorIndex < 0
+        || interiorAlpha < currentAlpha + 12
+      ) continue
 
       const offset = index * 4
-      const bestOffset = bestIndex * 4
+      const interiorOffset = interiorIndex * 4
       const normalizedAlpha = currentAlpha / 255
-      const strength = Math.min(
-        0.9,
-        (bestAlpha - currentAlpha) / 255 + (1 - normalizedAlpha) * 0.35,
-      )
+      if (
+        backgroundSampleCount === 0
+        || nearestBackgroundIndex < 0
+      ) {
+        // No removed exterior was reachable. Keep the previous conservative
+        // behavior as a fallback instead of guessing a background color.
+        const fallbackStrength = Math.min(
+          0.75,
+          (interiorAlpha - currentAlpha) / 255
+            + (1 - normalizedAlpha) * 0.25,
+        )
+        for (let channel = 0; channel < 3; channel += 1) {
+          pixels[offset + channel] = Math.round(
+            pixels[offset + channel] * (1 - fallbackStrength)
+            + pixels[interiorOffset + channel] * fallbackStrength,
+          )
+        }
+        continue
+      }
+
+      // Average nearby exterior samples that agree with the closest one. This
+      // smooths background noise without mixing colors from a different region.
+      const nearestBackgroundOffset = nearestBackgroundIndex * 4
+      let backgroundWeight = 0
+      backgroundColor.fill(0)
+      for (
+        let directionIndex = 0;
+        directionIndex < backgroundIndices.length;
+        directionIndex += 1
+      ) {
+        const backgroundIndex = backgroundIndices[directionIndex]
+        if (backgroundIndex < 0) continue
+        const backgroundOffset = backgroundIndex * 4
+        const redDelta = pixels[backgroundOffset]
+          - pixels[nearestBackgroundOffset]
+        const greenDelta = pixels[backgroundOffset + 1]
+          - pixels[nearestBackgroundOffset + 1]
+        const blueDelta = pixels[backgroundOffset + 2]
+          - pixels[nearestBackgroundOffset + 2]
+        if (
+          redDelta * redDelta
+            + greenDelta * greenDelta
+            + blueDelta * blueDelta
+          > backgroundToleranceSquared
+        ) continue
+
+        const weight = 1 / Math.max(
+          1,
+          backgroundDistances[directionIndex],
+        )
+        backgroundWeight += weight
+        for (let channel = 0; channel < 3; channel += 1) {
+          backgroundColor[channel] += (
+            pixels[backgroundOffset + channel] * weight
+          )
+        }
+      }
+      if (backgroundWeight === 0) continue
       for (let channel = 0; channel < 3; channel += 1) {
+        backgroundColor[channel] /= backgroundWeight
+      }
+
+      const redContrast = pixels[interiorOffset] - backgroundColor[0]
+      const greenContrast = pixels[interiorOffset + 1] - backgroundColor[1]
+      const blueContrast = pixels[interiorOffset + 2] - backgroundColor[2]
+      const contrast = Math.sqrt((
+        redContrast * redContrast
+          + greenContrast * greenContrast
+          + blueContrast * blueContrast
+      ) / 3)
+      const contrastConfidence = Math.max(
+        0,
+        Math.min(1, (contrast - 6) / 42),
+      )
+      if (contrastConfidence === 0) continue
+
+      const solveAlpha = Math.max(
+        DECONTAMINATION_MIN_SOLVE_ALPHA,
+        normalizedAlpha,
+      )
+      let clipping = 0
+      for (let channel = 0; channel < 3; channel += 1) {
+        // Observed = alpha * foreground + (1 - alpha) * background.
+        // Solve for the foreground color using the sampled removed exterior.
+        const rawForeground = (
+          pixels[offset + channel]
+          - (1 - solveAlpha) * backgroundColor[channel]
+        ) / solveAlpha
+        const clampedForeground = Math.max(
+          0,
+          Math.min(255, rawForeground),
+        )
+        clipping += Math.abs(rawForeground - clampedForeground)
+        unmixedColor[channel] = clampedForeground
+      }
+
+      const alphaReliability = Math.max(
+        0,
+        Math.min(
+          1,
+          (
+            normalizedAlpha - DECONTAMINATION_MIN_SOLVE_ALPHA
+          ) / 0.42,
+        ),
+      )
+      const clippingReliability = Math.max(
+        0,
+        Math.min(1, 1 - clipping / (3 * 160)),
+      )
+      const distanceConfidence = Math.max(
+        0.25,
+        1 - nearestBackgroundDistance / (radius * 1.5),
+      )
+      const solutionWeight = (
+        alphaReliability
+        * clippingReliability
+        * distanceConfidence
+      )
+      const correctionStrength = Math.min(
+        0.92,
+        (1 - normalizedAlpha) * 1.35,
+      ) * contrastConfidence * distanceConfidence
+
+      for (let channel = 0; channel < 3; channel += 1) {
+        // When division by a small alpha or channel clipping makes the inverse
+        // unstable, the existing nearest-interior color remains the fallback.
+        const safeForeground = (
+          unmixedColor[channel] * solutionWeight
+          + pixels[interiorOffset + channel] * (1 - solutionWeight)
+        )
         pixels[offset + channel] = Math.round(
-          pixels[offset + channel] * (1 - strength)
-          + pixels[bestOffset + channel] * strength,
+          pixels[offset + channel] * (1 - correctionStrength)
+          + safeForeground * correctionStrength,
         )
       }
     }
@@ -1626,8 +1800,11 @@ function applyFullResolutionAlpha(
     colorEdgeRadius,
   )
   const decontaminationRadius = Math.max(
-    4,
-    Math.min(8, Math.ceil(maskScale * 0.65)),
+    6,
+    Math.min(
+      MAX_DECONTAMINATION_RADIUS,
+      Math.ceil(maskScale),
+    ),
   )
   // Clean color spill while the edge is still a soft matte. Once polishAlpha
   // hardens that transition, contaminated pixels may become fully opaque and
