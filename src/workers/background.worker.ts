@@ -21,6 +21,15 @@ const MODEL_FILE_PARTS = [
   'model_fp16.onnx.part-1',
   'model_fp16.onnx.part-2',
   'model_fp16.onnx.part-3',
+  'model_fp16.onnx.part-4',
+  'model_fp16.onnx.part-5',
+  'model_fp16.onnx.part-6',
+  'model_fp16.onnx.part-7',
+  'model_fp16.onnx.part-8',
+  'model_fp16.onnx.part-9',
+  'model_fp16.onnx.part-10',
+  'model_fp16.onnx.part-11',
+  'model_fp16.onnx.part-12',
 ] as const
 const MAX_INFERENCE_EDGE = 512
 const COMPONENT_THRESHOLD = 24
