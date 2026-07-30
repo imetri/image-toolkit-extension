@@ -80,17 +80,18 @@ const MIN_ZOOM = 1;
 const MAX_ZOOM = 8;
 const UNDO_LIMIT = 12;
 const UNDO_TILE_SIZE = 128;
-const MAGIC_CANDIDATE_THRESHOLD = 32;
-const MAGIC_EDGE_CANDIDATE_THRESHOLD = 12;
+const MAGIC_CANDIDATE_THRESHOLD = 48;
+const MAGIC_PAINTED_CONFIDENCE_THRESHOLD = 96;
+const MAGIC_EDGE_CANDIDATE_THRESHOLD = 24;
 const MAGIC_MASK_ALPHA_THRESHOLD = 8;
-const MAGIC_GROWTH_RADIUS_SCALE = 1.75;
-const MAGIC_EDGE_EXPANSION_PASSES = 3;
+const MAGIC_GROWTH_RADIUS_SCALE = 1.4;
+const MAGIC_EDGE_EXPANSION_PASSES = 1;
 const MAGIC_MIN_ALPHA_TOLERANCE = 40;
-const MAGIC_MAX_ALPHA_TOLERANCE = 128;
+const MAGIC_MAX_ALPHA_TOLERANCE = 104;
 const MAGIC_MIN_COLOR_TOLERANCE = 64;
-const MAGIC_MAX_COLOR_TOLERANCE = 168;
-const MAGIC_LOCAL_EDGE_COLOR_TOLERANCE = 120;
-const MAGIC_LOCAL_EDGE_ALPHA_TOLERANCE = 96;
+const MAGIC_MAX_COLOR_TOLERANCE = 128;
+const MAGIC_LOCAL_EDGE_COLOR_TOLERANCE = 96;
+const MAGIC_LOCAL_EDGE_ALPHA_TOLERANCE = 72;
 
 function loadImage(blob: Blob): Promise<LoadedImage> {
   return new Promise((resolve, reject) => {
@@ -703,18 +704,11 @@ export function RefineEditor({
           ? predicted
           : 255 - predicted;
         const isPainted = paintPixels[offset + 3] > 24;
+        const isSampledHint = samplePixels[offset + 3] > 24;
         if (
           visiblePixels[offset + 3] > 0
           && growthPixels[offset + 3] > 24
         ) {
-          if (isPainted) {
-            aiCandidates[index] = 1;
-            candidates[index] = 1;
-            selected[index] = 1;
-            queue[write] = index;
-            write += 1;
-            continue;
-          }
           if (sideStrength < MAGIC_EDGE_CANDIDATE_THRESHOLD) continue;
           aiCandidates[index] = 1;
           const redDifference = visiblePixels[offset] - meanRed;
@@ -733,9 +727,24 @@ export function RefineEditor({
           );
           if (
             sideStrength >= MAGIC_CANDIDATE_THRESHOLD
-            && appearanceMatches
+            && (
+              appearanceMatches
+              || (
+                isPainted
+                && sideStrength >= MAGIC_PAINTED_CONFIDENCE_THRESHOLD
+              )
+            )
           ) {
             candidates[index] = 1;
+          }
+          if (
+            isSampledHint
+            && sideStrength >= MAGIC_CANDIDATE_THRESHOLD
+          ) {
+            candidates[index] = 1;
+            selected[index] = 1;
+            queue[write] = index;
+            write += 1;
           }
         }
       }
