@@ -137,6 +137,180 @@ function clamp(value: number, minimum: number, maximum: number) {
   return Math.min(maximum, Math.max(minimum, value));
 }
 
+function refineAiSelectionPixels(
+  maskPixels: ImageData,
+  visiblePixels: Uint8ClampedArray,
+  width: number,
+  height: number,
+  points: MagicPoint[],
+  cropLeft: number,
+  cropTop: number,
+) {
+  const pixelCount = width * height;
+  const selected = new Uint8Array(pixelCount);
+  const painted = new Uint8Array(pixelCount);
+  const isVisible = (index: number) => visiblePixels[index * 4 + 3] > 0;
+
+  for (let index = 0; index < pixelCount; index += 1) {
+    if (
+      maskPixels.data[index * 4 + 3] >= MAGIC_MASK_ALPHA_THRESHOLD
+      && isVisible(index)
+    ) selected[index] = 1;
+  }
+
+  // The user's stroke is a hard positive prompt. Reapply its visible pixels
+  // after inference so the model cannot punch holes through an area they
+  // explicitly painted.
+  let maximumPaintRadius = 1;
+  for (const point of points) {
+    const centerX = point.x - cropLeft;
+    const centerY = point.y - cropTop;
+    const radius = Math.max(1, point.radius);
+    maximumPaintRadius = Math.max(maximumPaintRadius, radius);
+    const radiusSquared = radius * radius;
+    const pointLeft = Math.max(0, Math.floor(centerX - radius));
+    const pointTop = Math.max(0, Math.floor(centerY - radius));
+    const pointRight = Math.min(width - 1, Math.ceil(centerX + radius));
+    const pointBottom = Math.min(height - 1, Math.ceil(centerY + radius));
+    for (let y = pointTop; y <= pointBottom; y += 1) {
+      const dy = y + 0.5 - centerY;
+      for (let x = pointLeft; x <= pointRight; x += 1) {
+        const dx = x + 0.5 - centerX;
+        if (dx * dx + dy * dy > radiusSquared) continue;
+        const index = y * width + x;
+        if (!isVisible(index)) continue;
+        painted[index] = 1;
+        selected[index] = 1;
+      }
+    }
+  }
+
+  // Close pinholes without flooding across genuine transparent gaps, such as
+  // the spaces between fingers.
+  const additions = new Uint8Array(pixelCount);
+  for (let pass = 0; pass < 2; pass += 1) {
+    additions.fill(0);
+    for (let y = 1; y < height - 1; y += 1) {
+      for (let x = 1; x < width - 1; x += 1) {
+        const index = y * width + x;
+        if (selected[index] || !isVisible(index)) continue;
+        let neighborCount = 0;
+        for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+          for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+            if (!offsetX && !offsetY) continue;
+            if (selected[index + offsetY * width + offsetX]) {
+              neighborCount += 1;
+            }
+          }
+        }
+        if (neighborCount >= 5) additions[index] = 1;
+      }
+    }
+    for (let index = 0; index < pixelCount; index += 1) {
+      if (additions[index]) selected[index] = 1;
+    }
+  }
+
+  // Recover one or two pixels of the visible silhouette. Restrict this growth
+  // to pixels beside transparency so it follows the cutout edge instead of
+  // expanding into adjacent clothing.
+  const edgePasses = clamp(
+    Math.round(maximumPaintRadius * 0.06),
+    1,
+    2,
+  );
+  for (let pass = 0; pass < edgePasses; pass += 1) {
+    additions.fill(0);
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const index = y * width + x;
+        if (selected[index] || !isVisible(index)) continue;
+        let touchesSelection = false;
+        let touchesTransparency = false;
+        for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+          const neighborY = y + offsetY;
+          if (neighborY < 0 || neighborY >= height) {
+            touchesTransparency = true;
+            continue;
+          }
+          for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+            if (!offsetX && !offsetY) continue;
+            const neighborX = x + offsetX;
+            if (neighborX < 0 || neighborX >= width) {
+              touchesTransparency = true;
+              continue;
+            }
+            const neighborIndex = neighborY * width + neighborX;
+            if (selected[neighborIndex]) touchesSelection = true;
+            if (!isVisible(neighborIndex)) touchesTransparency = true;
+          }
+        }
+        if (touchesSelection && touchesTransparency) additions[index] = 1;
+      }
+    }
+    for (let index = 0; index < pixelCount; index += 1) {
+      if (additions[index]) selected[index] = 1;
+    }
+  }
+
+  // Keep only mask islands reached by the painted prompt. This removes the
+  // small disconnected flecks that SAM can leave on nearby clothing.
+  const visited = new Uint8Array(pixelCount);
+  const refined = new Uint8Array(pixelCount);
+  const queue = new Int32Array(pixelCount);
+  for (let start = 0; start < pixelCount; start += 1) {
+    if (!selected[start] || visited[start]) continue;
+    let read = 0;
+    let write = 1;
+    let containsPaint = Boolean(painted[start]);
+    queue[0] = start;
+    visited[start] = 1;
+    while (read < write) {
+      const index = queue[read];
+      read += 1;
+      const x = index % width;
+      const y = Math.floor(index / width);
+      for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+        const neighborY = y + offsetY;
+        if (neighborY < 0 || neighborY >= height) continue;
+        for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+          if (!offsetX && !offsetY) continue;
+          const neighborX = x + offsetX;
+          if (neighborX < 0 || neighborX >= width) continue;
+          const neighborIndex = neighborY * width + neighborX;
+          if (!selected[neighborIndex] || visited[neighborIndex]) continue;
+          visited[neighborIndex] = 1;
+          if (painted[neighborIndex]) containsPaint = true;
+          queue[write] = neighborIndex;
+          write += 1;
+        }
+      }
+    }
+    if (!containsPaint) continue;
+    for (let index = 0; index < write; index += 1) {
+      refined[queue[index]] = 1;
+    }
+  }
+
+  let selectedPixelCount = 0;
+  for (let index = 0; index < pixelCount; index += 1) {
+    const offset = index * 4;
+    if (!refined[index]) {
+      maskPixels.data[offset] = 0;
+      maskPixels.data[offset + 1] = 0;
+      maskPixels.data[offset + 2] = 0;
+      maskPixels.data[offset + 3] = 0;
+      continue;
+    }
+    maskPixels.data[offset] = 83;
+    maskPixels.data[offset + 1] = 218;
+    maskPixels.data[offset + 2] = 190;
+    maskPixels.data[offset + 3] = 255;
+    selectedPixelCount += 1;
+  }
+  return selectedPixelCount;
+}
+
 export function RefineEditor({
   item,
   onClose,
@@ -793,7 +967,6 @@ export function RefineEditor({
         analysisWidth,
         analysisHeight,
       );
-      let selectedPixelCount = 0;
       for (let index = 0; index < result.mask.length; index += 1) {
         const offset = index * 4;
         if (
@@ -804,12 +977,6 @@ export function RefineEditor({
         previewPixels.data[offset + 1] = 218;
         previewPixels.data[offset + 2] = 190;
         previewPixels.data[offset + 3] = 255;
-        selectedPixelCount += 1;
-      }
-      if (!selectedPixelCount) {
-        throw new Error(
-          "The AI could not recognize an object under that stroke.",
-        );
       }
       previewContext.putImageData(previewPixels, 0, 0);
 
@@ -819,7 +986,7 @@ export function RefineEditor({
         magicCanvas.width,
         magicCanvas.height,
       );
-      magicContext.imageSmoothingEnabled = true;
+      magicContext.imageSmoothingEnabled = false;
       magicContext.drawImage(
         preview,
         0,
@@ -843,16 +1010,19 @@ export function RefineEditor({
         cropWidth,
         cropHeight,
       ).data;
-      for (
-        let offset = 3;
-        offset < fullResolutionMask.data.length;
-        offset += 4
-      ) {
-        fullResolutionMask.data[offset] =
-          fullResolutionMask.data[offset] >= MAGIC_MASK_ALPHA_THRESHOLD
-            && fullResolutionVisible[offset] > 4
-            ? 255
-            : 0;
+      const selectedPixelCount = refineAiSelectionPixels(
+        fullResolutionMask,
+        fullResolutionVisible,
+        cropWidth,
+        cropHeight,
+        points,
+        left,
+        top,
+      );
+      if (!selectedPixelCount) {
+        throw new Error(
+          "The AI could not recognize an object under that stroke.",
+        );
       }
       magicContext.putImageData(fullResolutionMask, left, top);
       magicSelectionRef.current = { left, top, right, bottom };
