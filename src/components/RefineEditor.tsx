@@ -83,13 +83,20 @@ const UNDO_TILE_SIZE = 128;
 const MAGIC_MASK_ALPHA_THRESHOLD = 128;
 const MAGIC_HINT_CORE_RADIUS_SCALE = 0.26;
 const MAGIC_GROWTH_RADIUS_SCALE = 1.35;
-const MAGIC_POINT_COLOR_TOLERANCE = 132;
-const MAGIC_POINT_LUMINANCE_TOLERANCE = 104;
-const MAGIC_POINT_CHROMA_TOLERANCE = 64;
-const MAGIC_POINT_MODEL_TOLERANCE = 208;
-const MAGIC_LOCAL_EDGE_COLOR_TOLERANCE = 120;
-const MAGIC_LOCAL_EDGE_ALPHA_TOLERANCE = 112;
-const MAGIC_LOCAL_EDGE_MODEL_TOLERANCE = 192;
+const MAGIC_ENDPOINT_GROWTH_RADIUS_SCALE = 0.45;
+const MAGIC_ENDPOINT_TAPER_DISTANCE_SCALE = 0.9;
+const MAGIC_POINT_COLOR_TOLERANCE = 110;
+const MAGIC_POINT_LUMINANCE_TOLERANCE = 82;
+const MAGIC_POINT_CHROMA_TOLERANCE = 56;
+const MAGIC_POINT_MODEL_TOLERANCE = 160;
+const MAGIC_SOFT_COLOR_TOLERANCE = 148;
+const MAGIC_SOFT_LUMINANCE_TOLERANCE = 116;
+const MAGIC_SOFT_CHROMA_TOLERANCE = 84;
+const MAGIC_SOFT_MODEL_TOLERANCE = 216;
+const MAGIC_HOLE_FILL_PASSES = 3;
+const MAGIC_LOCAL_EDGE_COLOR_TOLERANCE = 104;
+const MAGIC_LOCAL_EDGE_ALPHA_TOLERANCE = 96;
+const MAGIC_LOCAL_EDGE_MODEL_TOLERANCE = 160;
 
 function loadImage(blob: Blob): Promise<LoadedImage> {
   return new Promise((resolve, reject) => {
@@ -618,6 +625,22 @@ export function RefineEditor({
       if (!pointSamples.some(Boolean)) {
         throw new Error("Paint over a visible area to create an AI selection.");
       }
+      const strokeDistance = new Float64Array(analysisPaintPoints.length);
+      for (
+        let pointIndex = 1;
+        pointIndex < analysisPaintPoints.length;
+        pointIndex += 1
+      ) {
+        const point = analysisPaintPoints[pointIndex];
+        const previous = analysisPaintPoints[pointIndex - 1];
+        strokeDistance[pointIndex] = (
+          strokeDistance[pointIndex - 1]
+          + Math.hypot(point.x - previous.x, point.y - previous.y)
+        );
+      }
+      const totalStrokeDistance = (
+        strokeDistance[strokeDistance.length - 1] ?? 0
+      );
       const nearestPoint = new Int32Array(pixelCount);
       nearestPoint.fill(-1);
       const nearestDistance = new Float32Array(pixelCount);
@@ -629,9 +652,31 @@ export function RefineEditor({
       ) {
         if (!pointSamples[pointIndex]) continue;
         const point = analysisPaintPoints[pointIndex];
+        const endpointDistance = Math.min(
+          strokeDistance[pointIndex],
+          totalStrokeDistance - strokeDistance[pointIndex],
+        );
+        const endpointProgress = totalStrokeDistance > 0
+          ? clamp(
+              endpointDistance
+                / Math.max(
+                  1,
+                  point.radius * MAGIC_ENDPOINT_TAPER_DISTANCE_SCALE,
+                ),
+              0,
+              1,
+            )
+          : 0.25;
+        const growthScale = (
+          MAGIC_ENDPOINT_GROWTH_RADIUS_SCALE
+          + (
+            MAGIC_GROWTH_RADIUS_SCALE
+            - MAGIC_ENDPOINT_GROWTH_RADIUS_SCALE
+          ) * endpointProgress
+        );
         const radius = Math.max(
           1,
-          point.radius * MAGIC_GROWTH_RADIUS_SCALE,
+          point.radius * growthScale,
         );
         const growthLeft = Math.max(0, Math.floor(point.x - radius));
         const growthTop = Math.max(0, Math.floor(point.y - radius));
@@ -660,6 +705,7 @@ export function RefineEditor({
       }
 
       const candidates = new Uint8Array(pixelCount);
+      const softCandidates = new Uint8Array(pixelCount);
       const selected = new Uint8Array(pixelCount);
       const queue = new Int32Array(pixelCount);
       let write = 0;
@@ -683,15 +729,29 @@ export function RefineEditor({
         );
         const luminance = red * 0.2126 + green * 0.7152 + blue * 0.0722;
         const chroma = Math.max(red, green, blue) - Math.min(red, green, blue);
+        const luminanceDifference = Math.abs(
+          luminance - pointSample.luminance,
+        );
+        const chromaDifference = Math.abs(chroma - pointSample.chroma);
+        const modelDifference = Math.abs(
+          resultPixels[index] - pointSample.model,
+        );
+        if (
+          colorDistanceSquared
+            <= MAGIC_SOFT_COLOR_TOLERANCE
+              * MAGIC_SOFT_COLOR_TOLERANCE
+          && luminanceDifference <= MAGIC_SOFT_LUMINANCE_TOLERANCE
+          && chromaDifference <= MAGIC_SOFT_CHROMA_TOLERANCE
+          && modelDifference <= MAGIC_SOFT_MODEL_TOLERANCE
+        ) {
+          softCandidates[index] = 1;
+        }
         if (
           colorDistanceSquared
             > MAGIC_POINT_COLOR_TOLERANCE * MAGIC_POINT_COLOR_TOLERANCE
-          || Math.abs(luminance - pointSample.luminance)
-            > MAGIC_POINT_LUMINANCE_TOLERANCE
-          || Math.abs(chroma - pointSample.chroma)
-            > MAGIC_POINT_CHROMA_TOLERANCE
-          || Math.abs(resultPixels[index] - pointSample.model)
-            > MAGIC_POINT_MODEL_TOLERANCE
+          || luminanceDifference > MAGIC_POINT_LUMINANCE_TOLERANCE
+          || chromaDifference > MAGIC_POINT_CHROMA_TOLERANCE
+          || modelDifference > MAGIC_POINT_MODEL_TOLERANCE
         ) continue;
         const isSampledHint = samplePixels[offset + 3] > 24;
         candidates[index] = 1;
@@ -769,6 +829,36 @@ export function RefineEditor({
             index + analysisWidth,
             candidates,
           );
+        }
+      }
+
+      const fillPixels = new Uint8Array(pixelCount);
+      for (let pass = 0; pass < MAGIC_HOLE_FILL_PASSES; pass += 1) {
+        let fillCount = 0;
+        for (let index = 0; index < pixelCount; index += 1) {
+          if (selected[index] || !softCandidates[index]) continue;
+          const x = index % analysisWidth;
+          const y = Math.floor(index / analysisWidth);
+          let selectedNeighbors = 0;
+          if (x > 0 && selected[index - 1]) selectedNeighbors += 1;
+          if (x < analysisWidth - 1 && selected[index + 1]) {
+            selectedNeighbors += 1;
+          }
+          if (y > 0 && selected[index - analysisWidth]) {
+            selectedNeighbors += 1;
+          }
+          if (y < analysisHeight - 1 && selected[index + analysisWidth]) {
+            selectedNeighbors += 1;
+          }
+          if (selectedNeighbors < 3) continue;
+          fillPixels[index] = 1;
+          fillCount += 1;
+        }
+        if (!fillCount) break;
+        for (let index = 0; index < pixelCount; index += 1) {
+          if (!fillPixels[index]) continue;
+          selected[index] = 1;
+          fillPixels[index] = 0;
         }
       }
 
