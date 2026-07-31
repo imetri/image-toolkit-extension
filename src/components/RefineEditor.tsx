@@ -270,48 +270,6 @@ function refineAiSelectionPixels(
     }
   }
 
-  // Recover one or two pixels of the visible silhouette. Restrict this growth
-  // to pixels beside transparency so it follows the cutout edge instead of
-  // expanding into adjacent clothing.
-  const edgePasses = clamp(
-    Math.round(maximumPaintRadius * 0.06),
-    1,
-    2,
-  );
-  for (let pass = 0; pass < edgePasses; pass += 1) {
-    additions.fill(0);
-    for (let y = 0; y < height; y += 1) {
-      for (let x = 0; x < width; x += 1) {
-        const index = y * width + x;
-        if (selected[index] || !isVisible(index)) continue;
-        let touchesSelection = false;
-        let touchesTransparency = false;
-        for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
-          const neighborY = y + offsetY;
-          if (neighborY < 0 || neighborY >= height) {
-            touchesTransparency = true;
-            continue;
-          }
-          for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
-            if (!offsetX && !offsetY) continue;
-            const neighborX = x + offsetX;
-            if (neighborX < 0 || neighborX >= width) {
-              touchesTransparency = true;
-              continue;
-            }
-            const neighborIndex = neighborY * width + neighborX;
-            if (selected[neighborIndex]) touchesSelection = true;
-            if (!isVisible(neighborIndex)) touchesTransparency = true;
-          }
-        }
-        if (touchesSelection && touchesTransparency) additions[index] = 1;
-      }
-    }
-    for (let index = 0; index < pixelCount; index += 1) {
-      if (additions[index]) selected[index] = 1;
-    }
-  }
-
   // Keep only mask islands reached by the painted prompt. This removes the
   // small disconnected flecks that SAM can leave on nearby clothing.
   const visited = new Uint8Array(pixelCount);
@@ -349,6 +307,170 @@ function refineAiSelectionPixels(
     for (let index = 0; index < write; index += 1) {
       refined[queue[index]] = 1;
     }
+  }
+
+  // Fill only small, fully enclosed holes. Large unselected regions and gaps
+  // that lead to transparency remain untouched.
+  const maximumHoleArea = clamp(
+    Math.round(maximumPaintRadius * maximumPaintRadius * 0.35),
+    24,
+    512,
+  );
+  visited.fill(0);
+  for (let start = 0; start < pixelCount; start += 1) {
+    if (refined[start] || !isVisible(start) || visited[start]) continue;
+    let read = 0;
+    let write = 1;
+    let touchesExterior = false;
+    queue[0] = start;
+    visited[start] = 1;
+    while (read < write) {
+      const index = queue[read];
+      read += 1;
+      const x = index % width;
+      const y = Math.floor(index / width);
+      for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+        const neighborY = y + offsetY;
+        for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+          if (!offsetX && !offsetY) continue;
+          const neighborX = x + offsetX;
+          if (
+            neighborX < 0
+            || neighborX >= width
+            || neighborY < 0
+            || neighborY >= height
+          ) {
+            touchesExterior = true;
+            continue;
+          }
+          const neighborIndex = neighborY * width + neighborX;
+          if (!isVisible(neighborIndex)) {
+            touchesExterior = true;
+            continue;
+          }
+          if (refined[neighborIndex] || visited[neighborIndex]) continue;
+          visited[neighborIndex] = 1;
+          queue[write] = neighborIndex;
+          write += 1;
+        }
+      }
+    }
+    if (touchesExterior || write > maximumHoleArea) continue;
+    for (let index = 0; index < write; index += 1) {
+      refined[queue[index]] = 1;
+    }
+  }
+
+  // Recover a narrow omitted band only when it lies between the retained AI
+  // mask and actual transparency. Both distance searches stay inside visible
+  // pixels, so this cannot jump across finger gaps or spread into interior
+  // clothing.
+  const maximumEdgeBand = clamp(
+    Math.round(maximumPaintRadius * 0.18),
+    2,
+    6,
+  );
+  const selectionDistance = new Uint8Array(pixelCount);
+  const transparencyDistance = new Uint8Array(pixelCount);
+  selectionDistance.fill(255);
+  transparencyDistance.fill(255);
+  let read = 0;
+  let write = 0;
+  for (let index = 0; index < pixelCount; index += 1) {
+    if (!refined[index]) continue;
+    selectionDistance[index] = 0;
+    queue[write] = index;
+    write += 1;
+  }
+  while (read < write) {
+    const index = queue[read];
+    read += 1;
+    const distance = selectionDistance[index];
+    if (distance >= maximumEdgeBand) continue;
+    const x = index % width;
+    const y = Math.floor(index / width);
+    for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+      const neighborY = y + offsetY;
+      if (neighborY < 0 || neighborY >= height) continue;
+      for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+        if (!offsetX && !offsetY) continue;
+        const neighborX = x + offsetX;
+        if (neighborX < 0 || neighborX >= width) continue;
+        const neighborIndex = neighborY * width + neighborX;
+        if (
+          !isVisible(neighborIndex)
+          || selectionDistance[neighborIndex] <= distance + 1
+        ) continue;
+        selectionDistance[neighborIndex] = distance + 1;
+        queue[write] = neighborIndex;
+        write += 1;
+      }
+    }
+  }
+
+  read = 0;
+  write = 0;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (!isVisible(index)) continue;
+      let touchesTransparency = (
+        x === 0
+        || x === width - 1
+        || y === 0
+        || y === height - 1
+      );
+      if (!touchesTransparency) {
+        for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+          for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+            if (!offsetX && !offsetY) continue;
+            if (!isVisible(index + offsetY * width + offsetX)) {
+              touchesTransparency = true;
+            }
+          }
+        }
+      }
+      if (!touchesTransparency) continue;
+      transparencyDistance[index] = 1;
+      queue[write] = index;
+      write += 1;
+    }
+  }
+  while (read < write) {
+    const index = queue[read];
+    read += 1;
+    const distance = transparencyDistance[index];
+    if (distance >= maximumEdgeBand) continue;
+    const x = index % width;
+    const y = Math.floor(index / width);
+    for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+      const neighborY = y + offsetY;
+      if (neighborY < 0 || neighborY >= height) continue;
+      for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+        if (!offsetX && !offsetY) continue;
+        const neighborX = x + offsetX;
+        if (neighborX < 0 || neighborX >= width) continue;
+        const neighborIndex = neighborY * width + neighborX;
+        if (
+          !isVisible(neighborIndex)
+          || transparencyDistance[neighborIndex] <= distance + 1
+        ) continue;
+        transparencyDistance[neighborIndex] = distance + 1;
+        queue[write] = neighborIndex;
+        write += 1;
+      }
+    }
+  }
+  for (let index = 0; index < pixelCount; index += 1) {
+    if (refined[index] || !isVisible(index)) continue;
+    const fromSelection = selectionDistance[index];
+    const fromTransparency = transparencyDistance[index];
+    if (
+      fromSelection === 255
+      || fromTransparency === 255
+      || fromSelection + fromTransparency > maximumEdgeBand + 1
+    ) continue;
+    refined[index] = 1;
   }
 
   let selectedPixelCount = 0;
