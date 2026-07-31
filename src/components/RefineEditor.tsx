@@ -90,21 +90,21 @@ const UNDO_LIMIT = 12;
 const UNDO_TILE_SIZE = 128;
 const MAGIC_MASK_ALPHA_THRESHOLD = 128;
 const MAGIC_HINT_CORE_RADIUS_SCALE = 0.26;
-const MAGIC_GROWTH_RADIUS_SCALE = 1.35;
-const MAGIC_ENDPOINT_GROWTH_RADIUS_SCALE = 0.45;
+const MAGIC_GROWTH_RADIUS_SCALE = 1.08;
+const MAGIC_ENDPOINT_GROWTH_RADIUS_SCALE = 1;
 const MAGIC_ENDPOINT_TAPER_DISTANCE_SCALE = 0.9;
-const MAGIC_POINT_COLOR_TOLERANCE = 110;
-const MAGIC_POINT_LUMINANCE_TOLERANCE = 82;
-const MAGIC_POINT_CHROMA_TOLERANCE = 56;
-const MAGIC_POINT_MODEL_TOLERANCE = 160;
-const MAGIC_SOFT_COLOR_TOLERANCE = 148;
-const MAGIC_SOFT_LUMINANCE_TOLERANCE = 116;
-const MAGIC_SOFT_CHROMA_TOLERANCE = 84;
-const MAGIC_SOFT_MODEL_TOLERANCE = 216;
-const MAGIC_HOLE_FILL_PASSES = 3;
-const MAGIC_LOCAL_EDGE_COLOR_TOLERANCE = 104;
-const MAGIC_LOCAL_EDGE_ALPHA_TOLERANCE = 96;
-const MAGIC_LOCAL_EDGE_MODEL_TOLERANCE = 160;
+const MAGIC_POINT_COLOR_TOLERANCE = 76;
+const MAGIC_POINT_LUMINANCE_TOLERANCE = 58;
+const MAGIC_POINT_CHROMA_TOLERANCE = 42;
+const MAGIC_POINT_MODEL_TOLERANCE = 104;
+const MAGIC_SOFT_COLOR_TOLERANCE = 98;
+const MAGIC_SOFT_LUMINANCE_TOLERANCE = 74;
+const MAGIC_SOFT_CHROMA_TOLERANCE = 58;
+const MAGIC_SOFT_MODEL_TOLERANCE = 136;
+const MAGIC_HOLE_FILL_PASSES = 1;
+const MAGIC_LOCAL_EDGE_COLOR_TOLERANCE = 68;
+const MAGIC_LOCAL_EDGE_ALPHA_TOLERANCE = 64;
+const MAGIC_LOCAL_EDGE_MODEL_TOLERANCE = 104;
 
 function loadImage(blob: Blob): Promise<LoadedImage> {
   return new Promise((resolve, reject) => {
@@ -641,12 +641,15 @@ export function RefineEditor({
       );
       if (!sampleContext) throw new Error("Unable to read the painted hint.");
       sampleContext.fillStyle = "#fff";
-      for (const seed of analysisSeeds) {
+      // The painted brush is authoritative. AI may snap a short distance
+      // beyond it, but it must never remove visible pixels from the area the
+      // user explicitly covered.
+      for (const point of analysisPaintPoints) {
         sampleContext.beginPath();
         sampleContext.arc(
-          seed.x,
-          seed.y,
-          seed.radius,
+          point.x,
+          point.y,
+          point.radius,
           0,
           Math.PI * 2,
         );
@@ -810,8 +813,17 @@ export function RefineEditor({
 
       for (let index = 0; index < pixelCount; index += 1) {
         const offset = index * 4;
+        if (visiblePixels[offset + 3] <= 4) continue;
+        const isPaintedHint = samplePixels[offset + 3] > 24;
+        if (isPaintedHint) {
+          candidates[index] = 1;
+          softCandidates[index] = 1;
+          selected[index] = 1;
+          queue[write] = index;
+          write += 1;
+        }
         const pointIndex = nearestPoint[index];
-        if (pointIndex < 0 || visiblePixels[offset + 3] <= 4) continue;
+        if (pointIndex < 0) continue;
         const pointSample = pointSamples[pointIndex];
         if (!pointSample) continue;
         const red = sourcePixels[offset];
@@ -851,13 +863,7 @@ export function RefineEditor({
           || chromaDifference > MAGIC_POINT_CHROMA_TOLERANCE
           || modelDifference > MAGIC_POINT_MODEL_TOLERANCE
         ) continue;
-        const isSampledHint = samplePixels[offset + 3] > 24;
         candidates[index] = 1;
-        if (isSampledHint) {
-          selected[index] = 1;
-          queue[write] = index;
-          write += 1;
-        }
       }
       if (!write) {
         throw new Error(
@@ -991,6 +997,24 @@ export function RefineEditor({
         cropWidth,
         cropHeight,
       );
+      // Reapply the original stroke at canvas resolution before the final
+      // alpha intersection. This guarantees that painted foreground is never
+      // lost to analysis downscaling, while transparent finger gaps and
+      // background holes remain unselected.
+      magicContext.save();
+      magicContext.fillStyle = "rgb(83, 218, 190)";
+      for (const point of points) {
+        magicContext.beginPath();
+        magicContext.arc(
+          point.x,
+          point.y,
+          point.radius,
+          0,
+          Math.PI * 2,
+        );
+        magicContext.fill();
+      }
+      magicContext.restore();
       const fullResolutionMask = magicContext.getImageData(
         left,
         top,
