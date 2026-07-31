@@ -366,9 +366,9 @@ function refineAiSelectionPixels(
   // pixels, so this cannot jump across finger gaps or spread into interior
   // clothing.
   const maximumEdgeBand = clamp(
-    Math.round(maximumPaintRadius * 0.18),
-    2,
-    6,
+    Math.round(maximumPaintRadius * 0.26),
+    3,
+    8,
   );
   const selectionDistance = new Uint8Array(pixelCount);
   const transparencyDistance = new Uint8Array(pixelCount);
@@ -471,6 +471,69 @@ function refineAiSelectionPixels(
       || fromSelection + fromTransparency > maximumEdgeBand + 1
     ) continue;
     refined[index] = 1;
+  }
+
+  // Pick up the last antialiased object pixels along opaque internal
+  // boundaries (for example, a fingertip against dark clothing). Growth is
+  // capped at two pixels and requires a close color/luminance/chroma match to
+  // an already-retained neighbor, so it cannot reproduce the brush footprint.
+  const localEdgeColorToleranceSquared = 118 * 118;
+  for (let pass = 0; pass < 2; pass += 1) {
+    additions.fill(0);
+    for (let y = 1; y < height - 1; y += 1) {
+      for (let x = 1; x < width - 1; x += 1) {
+        const index = y * width + x;
+        if (refined[index] || !isVisible(index)) continue;
+        const offset = index * 4;
+        const red = visiblePixels[offset];
+        const green = visiblePixels[offset + 1];
+        const blue = visiblePixels[offset + 2];
+        const luminance = red * 0.2126 + green * 0.7152 + blue * 0.0722;
+        const chroma = Math.max(red, green, blue) - Math.min(red, green, blue);
+        let matchesRetainedEdge = false;
+        for (
+          let offsetY = -1;
+          offsetY <= 1 && !matchesRetainedEdge;
+          offsetY += 1
+        ) {
+          for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+            if (!offsetX && !offsetY) continue;
+            const neighborIndex = index + offsetY * width + offsetX;
+            if (!refined[neighborIndex]) continue;
+            const neighborOffset = neighborIndex * 4;
+            const neighborRed = visiblePixels[neighborOffset];
+            const neighborGreen = visiblePixels[neighborOffset + 1];
+            const neighborBlue = visiblePixels[neighborOffset + 2];
+            const redDifference = red - neighborRed;
+            const greenDifference = green - neighborGreen;
+            const blueDifference = blue - neighborBlue;
+            if (
+              redDifference * redDifference
+                + greenDifference * greenDifference
+                + blueDifference * blueDifference
+                  > localEdgeColorToleranceSquared
+            ) continue;
+            const neighborLuminance = (
+              neighborRed * 0.2126
+              + neighborGreen * 0.7152
+              + neighborBlue * 0.0722
+            );
+            if (Math.abs(luminance - neighborLuminance) > 72) continue;
+            const neighborChroma = (
+              Math.max(neighborRed, neighborGreen, neighborBlue)
+              - Math.min(neighborRed, neighborGreen, neighborBlue)
+            );
+            if (Math.abs(chroma - neighborChroma) > 48) continue;
+            matchesRetainedEdge = true;
+            break;
+          }
+        }
+        if (matchesRetainedEdge) additions[index] = 1;
+      }
+    }
+    for (let index = 0; index < pixelCount; index += 1) {
+      if (additions[index]) refined[index] = 1;
+    }
   }
 
   let selectedPixelCount = 0;
