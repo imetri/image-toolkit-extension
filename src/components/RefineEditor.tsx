@@ -82,10 +82,14 @@ const UNDO_LIMIT = 12;
 const UNDO_TILE_SIZE = 128;
 const MAGIC_MASK_ALPHA_THRESHOLD = 128;
 const MAGIC_HINT_CORE_RADIUS_SCALE = 0.26;
-const MAGIC_GROWTH_RADIUS_SCALE = 2;
-const MAGIC_LOCAL_EDGE_COLOR_TOLERANCE = 104;
-const MAGIC_LOCAL_EDGE_ALPHA_TOLERANCE = 96;
-const MAGIC_LOCAL_EDGE_MODEL_TOLERANCE = 160;
+const MAGIC_GROWTH_RADIUS_SCALE = 1.35;
+const MAGIC_POINT_COLOR_TOLERANCE = 132;
+const MAGIC_POINT_LUMINANCE_TOLERANCE = 104;
+const MAGIC_POINT_CHROMA_TOLERANCE = 64;
+const MAGIC_POINT_MODEL_TOLERANCE = 208;
+const MAGIC_LOCAL_EDGE_COLOR_TOLERANCE = 120;
+const MAGIC_LOCAL_EDGE_ALPHA_TOLERANCE = 112;
+const MAGIC_LOCAL_EDGE_MODEL_TOLERANCE = 192;
 
 function loadImage(blob: Blob): Promise<LoadedImage> {
   return new Promise((resolve, reject) => {
@@ -550,6 +554,70 @@ export function RefineEditor({
         analysisHeight,
       ).data;
       const pixelCount = analysisWidth * analysisHeight;
+      const pointSamples = analysisPaintPoints.map((point, pointIndex) => {
+        const searchRadius = Math.max(
+          1,
+          analysisSeeds[pointIndex]?.radius ?? 1,
+        );
+        const sampleLeft = Math.max(
+          0,
+          Math.floor(point.x - searchRadius),
+        );
+        const sampleTop = Math.max(
+          0,
+          Math.floor(point.y - searchRadius),
+        );
+        const sampleRight = Math.min(
+          analysisWidth - 1,
+          Math.ceil(point.x + searchRadius),
+        );
+        const sampleBottom = Math.min(
+          analysisHeight - 1,
+          Math.ceil(point.y + searchRadius),
+        );
+        let closestDistance = Number.POSITIVE_INFINITY;
+        let sample: {
+          red: number;
+          green: number;
+          blue: number;
+          luminance: number;
+          chroma: number;
+          model: number;
+        } | undefined;
+        for (let y = sampleTop; y <= sampleBottom; y += 1) {
+          for (let x = sampleLeft; x <= sampleRight; x += 1) {
+            const horizontalDistance = x + 0.5 - point.x;
+            const verticalDistance = y + 0.5 - point.y;
+            const distance = (
+              horizontalDistance * horizontalDistance
+              + verticalDistance * verticalDistance
+            );
+            if (
+              distance > searchRadius * searchRadius
+              || distance >= closestDistance
+            ) continue;
+            const index = y * analysisWidth + x;
+            const offset = index * 4;
+            if (visiblePixels[offset + 3] <= 4) continue;
+            const red = sourcePixels[offset];
+            const green = sourcePixels[offset + 1];
+            const blue = sourcePixels[offset + 2];
+            closestDistance = distance;
+            sample = {
+              red,
+              green,
+              blue,
+              luminance:red * 0.2126 + green * 0.7152 + blue * 0.0722,
+              chroma:Math.max(red, green, blue) - Math.min(red, green, blue),
+              model:resultPixels[index],
+            };
+          }
+        }
+        return sample;
+      });
+      if (!pointSamples.some(Boolean)) {
+        throw new Error("Paint over a visible area to create an AI selection.");
+      }
       const nearestPoint = new Int32Array(pixelCount);
       nearestPoint.fill(-1);
       const nearestDistance = new Float32Array(pixelCount);
@@ -559,6 +627,7 @@ export function RefineEditor({
         pointIndex < analysisPaintPoints.length;
         pointIndex += 1
       ) {
+        if (!pointSamples[pointIndex]) continue;
         const point = analysisPaintPoints[pointIndex];
         const radius = Math.max(
           1,
@@ -599,6 +668,31 @@ export function RefineEditor({
         const offset = index * 4;
         const pointIndex = nearestPoint[index];
         if (pointIndex < 0 || visiblePixels[offset + 3] <= 4) continue;
+        const pointSample = pointSamples[pointIndex];
+        if (!pointSample) continue;
+        const red = sourcePixels[offset];
+        const green = sourcePixels[offset + 1];
+        const blue = sourcePixels[offset + 2];
+        const redDifference = red - pointSample.red;
+        const greenDifference = green - pointSample.green;
+        const blueDifference = blue - pointSample.blue;
+        const colorDistanceSquared = (
+          redDifference * redDifference
+          + greenDifference * greenDifference
+          + blueDifference * blueDifference
+        );
+        const luminance = red * 0.2126 + green * 0.7152 + blue * 0.0722;
+        const chroma = Math.max(red, green, blue) - Math.min(red, green, blue);
+        if (
+          colorDistanceSquared
+            > MAGIC_POINT_COLOR_TOLERANCE * MAGIC_POINT_COLOR_TOLERANCE
+          || Math.abs(luminance - pointSample.luminance)
+            > MAGIC_POINT_LUMINANCE_TOLERANCE
+          || Math.abs(chroma - pointSample.chroma)
+            > MAGIC_POINT_CHROMA_TOLERANCE
+          || Math.abs(resultPixels[index] - pointSample.model)
+            > MAGIC_POINT_MODEL_TOLERANCE
+        ) continue;
         const isSampledHint = samplePixels[offset + 3] > 24;
         candidates[index] = 1;
         if (isSampledHint) {
