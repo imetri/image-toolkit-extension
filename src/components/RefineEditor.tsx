@@ -562,6 +562,57 @@ export function RefineEditor({
       analysisWidth,
       analysisHeight,
     ).data;
+    const finalizePaintedSelection = (clearExisting: boolean) => {
+      if (clearExisting) {
+        magicContext.clearRect(
+          0,
+          0,
+          magicCanvas.width,
+          magicCanvas.height,
+        );
+      }
+      magicContext.save();
+      magicContext.fillStyle = "rgb(83, 218, 190)";
+      for (const point of points) {
+        magicContext.beginPath();
+        magicContext.arc(
+          point.x,
+          point.y,
+          point.radius,
+          0,
+          Math.PI * 2,
+        );
+        magicContext.fill();
+      }
+      magicContext.restore();
+      const fullResolutionMask = magicContext.getImageData(
+        left,
+        top,
+        cropWidth,
+        cropHeight,
+      );
+      const fullResolutionVisible = workContext.getImageData(
+        left,
+        top,
+        cropWidth,
+        cropHeight,
+      ).data;
+      for (
+        let offset = 3;
+        offset < fullResolutionMask.data.length;
+        offset += 4
+      ) {
+        fullResolutionMask.data[offset] =
+          fullResolutionMask.data[offset] >= MAGIC_MASK_ALPHA_THRESHOLD
+            && fullResolutionVisible[offset] > 4
+            ? 255
+            : 0;
+      }
+      magicContext.putImageData(fullResolutionMask, left, top);
+      magicSelectionRef.current = { left, top, right, bottom };
+      setHasMagicSelection(true);
+      setMagicEditMode("remove");
+    };
 
     magicAbortRef.current?.abort();
     const controller = new AbortController();
@@ -569,7 +620,10 @@ export function RefineEditor({
     setAnalyzing(true);
     setHasMagicSelection(false);
     setError("");
-    setMagicStatus("Preparing AI selection");
+    setMagicStatus("Snapping painted area to edges");
+    // Display a usable, alpha-clipped selection immediately. The model is an
+    // optional refinement pass and can no longer suppress the user's stroke.
+    finalizePaintedSelection(true);
 
     try {
       const analysisSeeds = points.map(point => ({
@@ -997,63 +1051,17 @@ export function RefineEditor({
         cropWidth,
         cropHeight,
       );
-      // Reapply the original stroke at canvas resolution before the final
-      // alpha intersection. This guarantees that painted foreground is never
-      // lost to analysis downscaling, while transparent finger gaps and
-      // background holes remain unselected.
-      magicContext.save();
-      magicContext.fillStyle = "rgb(83, 218, 190)";
-      for (const point of points) {
-        magicContext.beginPath();
-        magicContext.arc(
-          point.x,
-          point.y,
-          point.radius,
-          0,
-          Math.PI * 2,
-        );
-        magicContext.fill();
-      }
-      magicContext.restore();
-      const fullResolutionMask = magicContext.getImageData(
-        left,
-        top,
-        cropWidth,
-        cropHeight,
-      );
-      const fullResolutionVisible = workContext.getImageData(
-        left,
-        top,
-        cropWidth,
-        cropHeight,
-      ).data;
-      for (
-        let offset = 3;
-        offset < fullResolutionMask.data.length;
-        offset += 4
-      ) {
-        fullResolutionMask.data[offset] =
-          fullResolutionMask.data[offset] >= MAGIC_MASK_ALPHA_THRESHOLD
-            && fullResolutionVisible[offset] > 4
-            ? 255
-            : 0;
-      }
-      magicContext.putImageData(fullResolutionMask, left, top);
-      magicSelectionRef.current = { left, top, right, bottom };
-      setHasMagicSelection(true);
-      setMagicEditMode("remove");
+      // Reapply the exact stroke after the AI preview so downscaling and
+      // inference can never create holes inside the painted foreground.
+      finalizePaintedSelection(false);
       setMagicStatus("AI selection ready");
     } catch (reason) {
       if (
         !(reason instanceof DOMException && reason.name === "AbortError")
         && !controller.signal.aborted
       ) {
-        clearMagicSelection();
-        setError(
-          reason instanceof Error
-            ? reason.message
-            : "Unable to create the AI selection.",
-        );
+        finalizePaintedSelection(true);
+        setMagicStatus("Painted selection ready");
       }
     } finally {
       if (magicAbortRef.current === controller) {
