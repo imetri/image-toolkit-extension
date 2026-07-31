@@ -193,6 +193,239 @@ function refineSelection({
   // If the prompt landed in a tiny model gap, preserve the model output
   // instead of returning an empty highlight.
   const outputSelection = retainedCount ? refined : selected;
+
+  // Fill only small, fully enclosed holes in the retained AI mask. This
+  // removes isolated unhighlighted blotches without closing transparent gaps
+  // or absorbing larger unselected regions.
+  const maximumHoleArea = clamp(
+    Math.round(maximumPaintRadius * maximumPaintRadius * 0.35),
+    24,
+    512,
+  );
+  visited.fill(0);
+  for (let start = 0; start < pixelCount; start += 1) {
+    if (
+      outputSelection[start]
+      || !isVisible(start)
+      || visited[start]
+    ) continue;
+    let read = 0;
+    let write = 1;
+    let touchesExterior = false;
+    queue[0] = start;
+    visited[start] = 1;
+    while (read < write) {
+      const index = queue[read];
+      read += 1;
+      const x = index % width;
+      const y = Math.floor(index / width);
+      for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+        const neighborY = y + offsetY;
+        for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+          if (!offsetX && !offsetY) continue;
+          const neighborX = x + offsetX;
+          if (
+            neighborX < 0
+            || neighborX >= width
+            || neighborY < 0
+            || neighborY >= height
+          ) {
+            touchesExterior = true;
+            continue;
+          }
+          const neighborIndex = neighborY * width + neighborX;
+          if (!isVisible(neighborIndex)) {
+            touchesExterior = true;
+            continue;
+          }
+          if (
+            outputSelection[neighborIndex]
+            || visited[neighborIndex]
+          ) continue;
+          visited[neighborIndex] = 1;
+          queue[write] = neighborIndex;
+          write += 1;
+        }
+      }
+    }
+    if (touchesExterior || write > maximumHoleArea) continue;
+    for (let index = 0; index < write; index += 1) {
+      outputSelection[queue[index]] = 1;
+    }
+  }
+
+  // Recover a narrow omitted band only when it sits between the retained mask
+  // and real transparency. Both searches remain within visible pixels, so the
+  // cleanup cannot bridge transparent finger gaps or grow a brush-shaped area.
+  const maximumEdgeBand = clamp(
+    Math.round(maximumPaintRadius * 0.26),
+    3,
+    8,
+  );
+  const selectionDistance = new Uint8Array(pixelCount);
+  const transparencyDistance = new Uint8Array(pixelCount);
+  selectionDistance.fill(255);
+  transparencyDistance.fill(255);
+  let read = 0;
+  let write = 0;
+  for (let index = 0; index < pixelCount; index += 1) {
+    if (!outputSelection[index]) continue;
+    selectionDistance[index] = 0;
+    queue[write] = index;
+    write += 1;
+  }
+  while (read < write) {
+    const index = queue[read];
+    read += 1;
+    const distance = selectionDistance[index];
+    if (distance >= maximumEdgeBand) continue;
+    const x = index % width;
+    const y = Math.floor(index / width);
+    for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+      const neighborY = y + offsetY;
+      if (neighborY < 0 || neighborY >= height) continue;
+      for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+        if (!offsetX && !offsetY) continue;
+        const neighborX = x + offsetX;
+        if (neighborX < 0 || neighborX >= width) continue;
+        const neighborIndex = neighborY * width + neighborX;
+        if (
+          !isVisible(neighborIndex)
+          || selectionDistance[neighborIndex] <= distance + 1
+        ) continue;
+        selectionDistance[neighborIndex] = distance + 1;
+        queue[write] = neighborIndex;
+        write += 1;
+      }
+    }
+  }
+
+  read = 0;
+  write = 0;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (!isVisible(index)) continue;
+      let touchesTransparency = (
+        x === 0
+        || x === width - 1
+        || y === 0
+        || y === height - 1
+      );
+      if (!touchesTransparency) {
+        for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+          for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+            if (!offsetX && !offsetY) continue;
+            if (!isVisible(index + offsetY * width + offsetX)) {
+              touchesTransparency = true;
+            }
+          }
+        }
+      }
+      if (!touchesTransparency) continue;
+      transparencyDistance[index] = 1;
+      queue[write] = index;
+      write += 1;
+    }
+  }
+  while (read < write) {
+    const index = queue[read];
+    read += 1;
+    const distance = transparencyDistance[index];
+    if (distance >= maximumEdgeBand) continue;
+    const x = index % width;
+    const y = Math.floor(index / width);
+    for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+      const neighborY = y + offsetY;
+      if (neighborY < 0 || neighborY >= height) continue;
+      for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+        if (!offsetX && !offsetY) continue;
+        const neighborX = x + offsetX;
+        if (neighborX < 0 || neighborX >= width) continue;
+        const neighborIndex = neighborY * width + neighborX;
+        if (
+          !isVisible(neighborIndex)
+          || transparencyDistance[neighborIndex] <= distance + 1
+        ) continue;
+        transparencyDistance[neighborIndex] = distance + 1;
+        queue[write] = neighborIndex;
+        write += 1;
+      }
+    }
+  }
+  for (let index = 0; index < pixelCount; index += 1) {
+    if (outputSelection[index] || !isVisible(index)) continue;
+    const fromSelection = selectionDistance[index];
+    const fromTransparency = transparencyDistance[index];
+    if (
+      fromSelection === 255
+      || fromTransparency === 255
+      || fromSelection + fromTransparency > maximumEdgeBand + 1
+    ) continue;
+    outputSelection[index] = 1;
+  }
+
+  // Pick up the final antialiased pixels along opaque internal boundaries.
+  // Growth is limited to two pixels and requires a close local color match.
+  const localEdgeColorToleranceSquared = 118 * 118;
+  for (let pass = 0; pass < 2; pass += 1) {
+    additions.fill(0);
+    for (let y = 1; y < height - 1; y += 1) {
+      for (let x = 1; x < width - 1; x += 1) {
+        const index = y * width + x;
+        if (outputSelection[index] || !isVisible(index)) continue;
+        const offset = index * 4;
+        const red = visible[offset];
+        const green = visible[offset + 1];
+        const blue = visible[offset + 2];
+        const luminance = red * 0.2126 + green * 0.7152 + blue * 0.0722;
+        const chroma = Math.max(red, green, blue) - Math.min(red, green, blue);
+        let matchesRetainedEdge = false;
+        for (
+          let offsetY = -1;
+          offsetY <= 1 && !matchesRetainedEdge;
+          offsetY += 1
+        ) {
+          for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+            if (!offsetX && !offsetY) continue;
+            const neighborIndex = index + offsetY * width + offsetX;
+            if (!outputSelection[neighborIndex]) continue;
+            const neighborOffset = neighborIndex * 4;
+            const neighborRed = visible[neighborOffset];
+            const neighborGreen = visible[neighborOffset + 1];
+            const neighborBlue = visible[neighborOffset + 2];
+            const redDifference = red - neighborRed;
+            const greenDifference = green - neighborGreen;
+            const blueDifference = blue - neighborBlue;
+            if (
+              redDifference * redDifference
+                + greenDifference * greenDifference
+                + blueDifference * blueDifference
+                  > localEdgeColorToleranceSquared
+            ) continue;
+            const neighborLuminance = (
+              neighborRed * 0.2126
+              + neighborGreen * 0.7152
+              + neighborBlue * 0.0722
+            );
+            if (Math.abs(luminance - neighborLuminance) > 72) continue;
+            const neighborChroma = (
+              Math.max(neighborRed, neighborGreen, neighborBlue)
+              - Math.min(neighborRed, neighborGreen, neighborBlue)
+            );
+            if (Math.abs(chroma - neighborChroma) > 48) continue;
+            matchesRetainedEdge = true;
+            break;
+          }
+        }
+        if (matchesRetainedEdge) additions[index] = 1;
+      }
+    }
+    for (let index = 0; index < pixelCount; index += 1) {
+      if (additions[index]) outputSelection[index] = 1;
+    }
+  }
+
   const output = new Uint8ClampedArray(pixelCount * 4);
   let selectedPixelCount = 0;
   for (let index = 0; index < pixelCount; index += 1) {
