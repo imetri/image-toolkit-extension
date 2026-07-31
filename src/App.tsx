@@ -668,17 +668,6 @@ export default function App() {
                       : "Your processed files are ready."}
                   </p>
                 </div>
-                <div className="result-actions">
-                  <Button variant="secondary" onClick={clear}>
-                    Clear
-                  </Button>
-                  <Button variant="secondary" onClick={downloadAllFiles}>
-                    <ArrowDownToLine size={17} /> Download all
-                  </Button>
-                  <Button onClick={downloadZip}>
-                    <Archive size={17} /> Download as ZIP
-                  </Button>
-                </div>
               </div>
               <div className="result-list">
                 {results.map((item) => (
@@ -716,6 +705,17 @@ export default function App() {
                     </div>
                   </article>
                 ))}
+              </div>
+              <div className="result-actions">
+                <Button variant="secondary" onClick={clear}>
+                  Clear
+                </Button>
+                <Button variant="secondary" onClick={downloadAllFiles}>
+                  <ArrowDownToLine size={17} /> Download all
+                </Button>
+                <Button onClick={downloadZip}>
+                  <Archive size={17} /> Download as ZIP
+                </Button>
               </div>
             </motion.section>
           )}

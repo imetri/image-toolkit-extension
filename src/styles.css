@@ -721,8 +721,10 @@ main {
 }
 
 .result-actions {
+  padding: 0 22px 18px;
   display: flex;
   flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 8px;
 }
 
@@ -1316,16 +1318,22 @@ main {
     flex: 1;
   }
 
+  .result-actions {
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+
   .refine-header {
     min-height: 58px;
   }
 
   .refine-toolbar {
     padding: 7px 9px;
+    gap: 6px;
   }
 
   .refine-tool-group button {
-    padding: 0 8px;
+    padding: 0 6px;
   }
 
   .refine-tool-group button span,
@@ -1334,8 +1342,9 @@ main {
   }
 
   .refine-size {
-    min-width: 150px;
-    grid-template-columns: auto minmax(70px, 1fr) 38px;
+    min-width: 110px;
+    grid-template-columns: auto minmax(34px, 1fr) 28px;
+    gap: 6px;
   }
 
   .refine-footer {
@@ -1348,19 +1357,35 @@ main {
   .zoom-control {
     min-width: 0;
     flex: 1;
-    grid-template-columns: 30px minmax(60px, 1fr) 30px 50px;
+    grid-template-columns: 28px minmax(24px, 1fr) 28px 42px;
+    gap: 4px;
+  }
+
+  .zoom-control button {
+    width: 28px;
+    height: 32px;
   }
 
   .zoom-control button.zoom-value {
-    width: 50px;
+    width: 42px;
+    font-size: 9px;
   }
 
   .refine-actions {
+    min-width: 0;
     margin-left: auto;
   }
 
   .refine-actions .btn-secondary {
     display: none;
+  }
+
+  .refine-actions .btn-primary {
+    min-width: 0;
+    padding-right: 10px;
+    padding-left: 10px;
+    font-size: 11px;
+    white-space: nowrap;
   }
 }
 

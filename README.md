@@ -27,7 +27,9 @@ The Vite dev server is useful for UI work. Browser-extension testing should use 
 npm run build
 ```
 
-In Chrome, open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select the `dist` folder.
+In Chrome, open `chrome://extensions`, enable Developer mode, choose **Load
+unpacked**, and select the `dist` folder. Pin ImageFlow if desired, then click
+its toolbar icon to toggle the native Chrome side panel.
 
 ## Architecture
 
