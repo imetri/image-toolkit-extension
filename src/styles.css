@@ -928,6 +928,25 @@ main {
   font-weight: 700;
 }
 
+.magic-mask-mode {
+  padding: 0 8px;
+  color: #147d6b;
+  background: transparent;
+}
+
+.magic-mask-mode:hover {
+  background: rgba(20, 125, 107, 0.1);
+}
+
+.magic-mask-mode.selected {
+  color: #fff;
+  background: #2b9d89;
+}
+
+.magic-mask-mode.selected.remove {
+  background: #b54a58;
+}
+
 .apply-magic-selection {
   padding: 0 10px;
   color: #fff;

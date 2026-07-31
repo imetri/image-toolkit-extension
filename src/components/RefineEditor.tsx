@@ -23,6 +23,7 @@ import type { ProcessedItem } from "../types";
 import { Button } from "./ui";
 
 type RefineTool = "restore" | "erase" | "magic" | "move";
+type MagicEditMode = "add" | "remove";
 
 type MagicPoint = {
   x: number;
@@ -69,6 +70,13 @@ type PointerAction =
       lastX: number;
       lastY: number;
       points: MagicPoint[];
+    }
+  | {
+      type: "magic-edit";
+      pointerId: number;
+      lastX: number;
+      lastY: number;
+      mode: MagicEditMode;
     };
 
 type LoadedImage = {
@@ -164,6 +172,8 @@ export function RefineEditor({
   const [isAnalyzing, setAnalyzing] = useState(false);
   const [magicStatus, setMagicStatus] = useState("");
   const [hasMagicSelection, setHasMagicSelection] = useState(false);
+  const [magicEditMode, setMagicEditMode] =
+    useState<MagicEditMode>("remove");
   const [error, setError] = useState("");
   const [undoCount, setUndoCount] = useState(0);
   const [hasChanges, setHasChanges] = useState(false);
@@ -208,6 +218,94 @@ export function RefineEditor({
     context.fill();
     context.restore();
   }, []);
+
+  const editMagicSelectionStamp = useCallback((
+    x: number,
+    y: number,
+    radius: number,
+    mode: MagicEditMode,
+  ) => {
+    const magicCanvas = magicCanvasRef.current;
+    const canvas = canvasRef.current;
+    const magicContext = magicCanvas?.getContext(
+      "2d",
+      { willReadFrequently:true },
+    );
+    const workContext = canvas?.getContext(
+      "2d",
+      { willReadFrequently:true },
+    );
+    if (!magicCanvas || !canvas || !magicContext || !workContext) return;
+    const left = Math.max(0, Math.floor(x - radius));
+    const top = Math.max(0, Math.floor(y - radius));
+    const right = Math.min(magicCanvas.width, Math.ceil(x + radius));
+    const bottom = Math.min(magicCanvas.height, Math.ceil(y + radius));
+    if (right <= left || bottom <= top) return;
+
+    magicContext.save();
+    magicContext.globalCompositeOperation = mode === "add"
+      ? "source-over"
+      : "destination-out";
+    magicContext.fillStyle = "rgba(83, 218, 190, 1)";
+    magicContext.beginPath();
+    magicContext.arc(x, y, radius, 0, Math.PI * 2);
+    magicContext.fill();
+    magicContext.restore();
+
+    if (mode === "add") {
+      const maskPixels = magicContext.getImageData(
+        left,
+        top,
+        right - left,
+        bottom - top,
+      );
+      const visiblePixels = workContext.getImageData(
+        left,
+        top,
+        right - left,
+        bottom - top,
+      ).data;
+      for (
+        let offset = 3;
+        offset < maskPixels.data.length;
+        offset += 4
+      ) {
+        if (visiblePixels[offset] <= 4) maskPixels.data[offset] = 0;
+      }
+      magicContext.putImageData(maskPixels, left, top);
+      const selection = magicSelectionRef.current;
+      magicSelectionRef.current = selection
+        ? {
+            left:Math.min(selection.left, left),
+            top:Math.min(selection.top, top),
+            right:Math.max(selection.right, right),
+            bottom:Math.max(selection.bottom, bottom),
+          }
+        : { left, top, right, bottom };
+    }
+  }, []);
+
+  const editMagicSelectionLine = useCallback((
+    fromX: number,
+    fromY: number,
+    toX: number,
+    toY: number,
+    radius: number,
+    mode: MagicEditMode,
+  ) => {
+    const distance = Math.hypot(toX - fromX, toY - fromY);
+    const spacing = Math.max(1, radius * 0.28);
+    const steps = Math.max(1, Math.ceil(distance / spacing));
+    for (let step = 1; step <= steps; step += 1) {
+      const progress = step / steps;
+      editMagicSelectionStamp(
+        fromX + (toX - fromX) * progress,
+        fromY + (toY - fromY) * progress,
+        radius,
+        mode,
+      );
+    }
+  }, [editMagicSelectionStamp]);
 
   useEffect(() => {
     const viewport = viewportRef.current;
@@ -919,6 +1017,7 @@ export function RefineEditor({
       magicContext.putImageData(fullResolutionMask, left, top);
       magicSelectionRef.current = { left, top, right, bottom };
       setHasMagicSelection(true);
+      setMagicEditMode("remove");
       setMagicStatus("AI selection ready");
     } catch (reason) {
       if (
@@ -1077,6 +1176,16 @@ export function RefineEditor({
         selectTool("erase");
       } else if (event.key.toLowerCase() === "w") {
         selectTool("magic");
+      } else if (
+        hasMagicSelection
+        && event.key.toLowerCase() === "a"
+      ) {
+        setMagicEditMode("add");
+      } else if (
+        hasMagicSelection
+        && event.key.toLowerCase() === "s"
+      ) {
+        setMagicEditMode("remove");
       } else if (event.key === "Escape" && !isSaving) {
         if (isAnalyzing) {
           magicAbortRef.current?.abort();
@@ -1127,6 +1236,22 @@ export function RefineEditor({
     const point = canvasPoint(event.clientX, event.clientY);
     if (!point) return;
     if (tool === "magic") {
+      if (hasMagicSelection) {
+        editMagicSelectionStamp(
+          point.x,
+          point.y,
+          point.radius,
+          magicEditMode,
+        );
+        pointerActionRef.current = {
+          type:"magic-edit",
+          pointerId:event.pointerId,
+          lastX:point.x,
+          lastY:point.y,
+          mode:magicEditMode,
+        };
+        return;
+      }
       clearMagicSelection();
       const magicPoint = {
         x:point.x,
@@ -1173,6 +1298,19 @@ export function RefineEditor({
     }
     const point = canvasPoint(event.clientX, event.clientY);
     if (!point) return;
+    if (action.type === "magic-edit") {
+      editMagicSelectionLine(
+        action.lastX,
+        action.lastY,
+        point.x,
+        point.y,
+        point.radius,
+        action.mode,
+      );
+      action.lastX = point.x;
+      action.lastY = point.y;
+      return;
+    }
     if (action.type === "magic") {
       const distance = Math.hypot(
         point.x - action.lastX,
@@ -1300,7 +1438,13 @@ export function RefineEditor({
           </label>
 
           {(isAnalyzing || hasMagicSelection) && (
-            <div className="magic-selection-actions" role="status">
+            <div
+              className="magic-selection-actions"
+              role={isAnalyzing ? "status" : "group"}
+              aria-label={
+                isAnalyzing ? undefined : "Edit AI highlight"
+              }
+            >
               {isAnalyzing ? (
                 <>
                   <LoaderCircle className="spin" size={16} />
@@ -1308,6 +1452,34 @@ export function RefineEditor({
                 </>
               ) : (
                 <>
+                  <button
+                    type="button"
+                    className={
+                      magicEditMode === "add"
+                        ? "magic-mask-mode selected"
+                        : "magic-mask-mode"
+                    }
+                    onClick={() => setMagicEditMode("add")}
+                    aria-pressed={magicEditMode === "add"}
+                    title="Paint missing highlight (A)"
+                  >
+                    <Brush size={14} />
+                    Add
+                  </button>
+                  <button
+                    type="button"
+                    className={
+                      magicEditMode === "remove"
+                        ? "magic-mask-mode selected remove"
+                        : "magic-mask-mode remove"
+                    }
+                    onClick={() => setMagicEditMode("remove")}
+                    aria-pressed={magicEditMode === "remove"}
+                    title="Paint away excess highlight (S)"
+                  >
+                    <Eraser size={14} />
+                    Remove
+                  </button>
                   <button
                     type="button"
                     className="apply-magic-selection"
@@ -1450,7 +1622,7 @@ export function RefineEditor({
               isAnalyzing
                 ? magicStatus || "Finding the exact region"
                 : hasMagicSelection
-                  ? "Review the highlight, then erase it or clear the selection."
+                  ? "Paint with Add or Remove to correct the highlight, then erase it."
                   : tool === "move"
                     ? "Drag to move. Scroll to zoom."
                     : tool === "magic"
