@@ -82,16 +82,10 @@ const UNDO_LIMIT = 12;
 const UNDO_TILE_SIZE = 128;
 const MAGIC_MASK_ALPHA_THRESHOLD = 128;
 const MAGIC_HINT_CORE_RADIUS_SCALE = 0.26;
-const MAGIC_GROWTH_RADIUS_SCALE = 2.75;
-const MAGIC_SAMPLE_CORE_SCALE = 0.36;
-const MAGIC_MIN_ALPHA_TOLERANCE = 28;
-const MAGIC_MAX_ALPHA_TOLERANCE = 72;
-const MAGIC_MIN_COLOR_TOLERANCE = 32;
-const MAGIC_MAX_COLOR_TOLERANCE = 80;
-const MAGIC_MIN_MODEL_TOLERANCE = 48;
-const MAGIC_MAX_MODEL_TOLERANCE = 112;
-const MAGIC_LOCAL_EDGE_COLOR_TOLERANCE = 48;
-const MAGIC_LOCAL_EDGE_ALPHA_TOLERANCE = 48;
+const MAGIC_GROWTH_RADIUS_SCALE = 2;
+const MAGIC_LOCAL_EDGE_COLOR_TOLERANCE = 104;
+const MAGIC_LOCAL_EDGE_ALPHA_TOLERANCE = 96;
+const MAGIC_LOCAL_EDGE_MODEL_TOLERANCE = 160;
 
 function loadImage(blob: Blob): Promise<LoadedImage> {
   return new Promise((resolve, reject) => {
@@ -556,110 +550,6 @@ export function RefineEditor({
         analysisHeight,
       ).data;
       const pixelCount = analysisWidth * analysisHeight;
-      const pointSamples = analysisSeeds.map(seed => {
-        const radius = Math.max(
-          1,
-          seed.radius * MAGIC_SAMPLE_CORE_SCALE,
-        );
-        const sampleLeft = Math.max(0, Math.floor(seed.x - radius));
-        const sampleTop = Math.max(0, Math.floor(seed.y - radius));
-        const sampleRight = Math.min(
-          analysisWidth - 1,
-          Math.ceil(seed.x + radius),
-        );
-        const sampleBottom = Math.min(
-          analysisHeight - 1,
-          Math.ceil(seed.y + radius),
-        );
-        let red = 0;
-        let green = 0;
-        let blue = 0;
-        let alpha = 0;
-        let model = 0;
-        let redSquared = 0;
-        let greenSquared = 0;
-        let blueSquared = 0;
-        let alphaSquared = 0;
-        let modelSquared = 0;
-        let count = 0;
-        for (let y = sampleTop; y <= sampleBottom; y += 1) {
-          const normalizedY = (y + 0.5 - seed.y) / radius;
-          for (let x = sampleLeft; x <= sampleRight; x += 1) {
-            const normalizedX = (x + 0.5 - seed.x) / radius;
-            if (
-              normalizedX * normalizedX + normalizedY * normalizedY > 1
-            ) continue;
-            const index = y * analysisWidth + x;
-            const offset = index * 4;
-            if (visiblePixels[offset + 3] <= 4) continue;
-            const pixelRed = sourcePixels[offset];
-            const pixelGreen = sourcePixels[offset + 1];
-            const pixelBlue = sourcePixels[offset + 2];
-            const pixelAlpha = visiblePixels[offset + 3];
-            const pixelModel = resultPixels[index];
-            red += pixelRed;
-            green += pixelGreen;
-            blue += pixelBlue;
-            alpha += pixelAlpha;
-            model += pixelModel;
-            redSquared += pixelRed * pixelRed;
-            greenSquared += pixelGreen * pixelGreen;
-            blueSquared += pixelBlue * pixelBlue;
-            alphaSquared += pixelAlpha * pixelAlpha;
-            modelSquared += pixelModel * pixelModel;
-            count += 1;
-          }
-        }
-        if (!count) return undefined;
-        const meanRed = red / count;
-        const meanGreen = green / count;
-        const meanBlue = blue / count;
-        const meanAlpha = alpha / count;
-        const meanModel = model / count;
-        const colorDeviation = Math.sqrt(Math.max(
-          0,
-          (
-            redSquared / count - meanRed * meanRed
-            + greenSquared / count - meanGreen * meanGreen
-            + blueSquared / count - meanBlue * meanBlue
-          ) / 3,
-        ));
-        const alphaDeviation = Math.sqrt(Math.max(
-          0,
-          alphaSquared / count - meanAlpha * meanAlpha,
-        ));
-        const modelDeviation = Math.sqrt(Math.max(
-          0,
-          modelSquared / count - meanModel * meanModel,
-        ));
-        const colorTolerance = clamp(
-          30 + colorDeviation * 1.8,
-          MAGIC_MIN_COLOR_TOLERANCE,
-          MAGIC_MAX_COLOR_TOLERANCE,
-        );
-        return {
-          red:meanRed,
-          green:meanGreen,
-          blue:meanBlue,
-          alpha:meanAlpha,
-          model:meanModel,
-          colorToleranceSquared:colorTolerance * colorTolerance,
-          alphaTolerance:clamp(
-            24 + alphaDeviation * 1.8,
-            MAGIC_MIN_ALPHA_TOLERANCE,
-            MAGIC_MAX_ALPHA_TOLERANCE,
-          ),
-          modelTolerance:clamp(
-            40 + modelDeviation * 2,
-            MAGIC_MIN_MODEL_TOLERANCE,
-            MAGIC_MAX_MODEL_TOLERANCE,
-          ),
-        };
-      });
-      if (!pointSamples.some(Boolean)) {
-        throw new Error("Paint over a visible area to create an AI selection.");
-      }
-
       const nearestPoint = new Int32Array(pixelCount);
       nearestPoint.fill(-1);
       const nearestDistance = new Float32Array(pixelCount);
@@ -669,7 +559,6 @@ export function RefineEditor({
         pointIndex < analysisPaintPoints.length;
         pointIndex += 1
       ) {
-        if (!pointSamples[pointIndex]) continue;
         const point = analysisPaintPoints[pointIndex];
         const radius = Math.max(
           1,
@@ -710,35 +599,9 @@ export function RefineEditor({
         const offset = index * 4;
         const pointIndex = nearestPoint[index];
         if (pointIndex < 0 || visiblePixels[offset + 3] <= 4) continue;
-        const pointSample = pointSamples[pointIndex];
-        if (!pointSample) continue;
         const isSampledHint = samplePixels[offset + 3] > 24;
-        const redDifference = sourcePixels[offset] - pointSample.red;
-        const greenDifference = (
-          sourcePixels[offset + 1] - pointSample.green
-        );
-        const blueDifference = (
-          sourcePixels[offset + 2] - pointSample.blue
-        );
-        const colorDistanceSquared = (
-          redDifference * redDifference
-          + greenDifference * greenDifference
-          + blueDifference * blueDifference
-        );
-        const appearanceMatches = (
-          colorDistanceSquared <= pointSample.colorToleranceSquared
-          && Math.abs(
-            visiblePixels[offset + 3] - pointSample.alpha,
-          ) <= pointSample.alphaTolerance
-          && Math.abs(
-            resultPixels[index] - pointSample.model,
-          ) <= pointSample.modelTolerance
-        );
-        if (appearanceMatches) {
-          candidates[index] = 1;
-        }
-        if (isSampledHint && appearanceMatches) {
-          candidates[index] = 1;
+        candidates[index] = 1;
+        if (isSampledHint) {
           selected[index] = 1;
           queue[write] = index;
           write += 1;
@@ -780,6 +643,9 @@ export function RefineEditor({
             visiblePixels[currentOffset + 3]
               - visiblePixels[neighborOffset + 3],
           ) > MAGIC_LOCAL_EDGE_ALPHA_TOLERANCE
+          || Math.abs(
+            resultPixels[current] - resultPixels[neighbor],
+          ) > MAGIC_LOCAL_EDGE_MODEL_TOLERANCE
         ) return;
         selected[neighbor] = 1;
         queue[write] = neighbor;
