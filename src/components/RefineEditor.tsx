@@ -158,20 +158,20 @@ function refineAiSelectionPixels(
     ) selected[index] = 1;
   }
 
-  // The user's stroke is a hard positive prompt. Reapply its visible pixels
-  // after inference so the model cannot punch holes through an area they
-  // explicitly painted.
+  // Keep a narrow record of the stroke centerline for cleanup guidance. It is
+  // deliberately not merged into the output: the AI mask, not the brush
+  // footprint, remains the selection.
   let maximumPaintRadius = 1;
   for (const point of points) {
     const centerX = point.x - cropLeft;
     const centerY = point.y - cropTop;
-    const radius = Math.max(1, point.radius);
-    maximumPaintRadius = Math.max(maximumPaintRadius, radius);
-    const radiusSquared = radius * radius;
-    const pointLeft = Math.max(0, Math.floor(centerX - radius));
-    const pointTop = Math.max(0, Math.floor(centerY - radius));
-    const pointRight = Math.min(width - 1, Math.ceil(centerX + radius));
-    const pointBottom = Math.min(height - 1, Math.ceil(centerY + radius));
+    maximumPaintRadius = Math.max(maximumPaintRadius, point.radius);
+    const coreRadius = Math.max(1.5, point.radius * 0.32);
+    const radiusSquared = coreRadius * coreRadius;
+    const pointLeft = Math.max(0, Math.floor(centerX - coreRadius));
+    const pointTop = Math.max(0, Math.floor(centerY - coreRadius));
+    const pointRight = Math.min(width - 1, Math.ceil(centerX + coreRadius));
+    const pointBottom = Math.min(height - 1, Math.ceil(centerY + coreRadius));
     for (let y = pointTop; y <= pointBottom; y += 1) {
       const dy = y + 0.5 - centerY;
       for (let x = pointLeft; x <= pointRight; x += 1) {
@@ -180,14 +180,73 @@ function refineAiSelectionPixels(
         const index = y * width + x;
         if (!isVisible(index)) continue;
         painted[index] = 1;
-        selected[index] = 1;
       }
     }
   }
 
+  // Repair only a break that has recognized mask on opposing sides of the
+  // painted centerline. This closes short internal misses without extending
+  // beyond a finger or reproducing the user's circular brush stamp.
+  const additions = new Uint8Array(pixelCount);
+  const bridgeDistance = clamp(
+    Math.round(maximumPaintRadius * 0.72),
+    3,
+    12,
+  );
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (!painted[index] || selected[index] || !isVisible(index)) continue;
+      let directions = 0;
+      for (
+        let offsetY = -bridgeDistance;
+        offsetY <= bridgeDistance;
+        offsetY += 1
+      ) {
+        const neighborY = y + offsetY;
+        if (neighborY < 0 || neighborY >= height) continue;
+        for (
+          let offsetX = -bridgeDistance;
+          offsetX <= bridgeDistance;
+          offsetX += 1
+        ) {
+          if (!offsetX && !offsetY) continue;
+          if (
+            offsetX * offsetX + offsetY * offsetY
+              > bridgeDistance * bridgeDistance
+          ) continue;
+          const neighborX = x + offsetX;
+          if (neighborX < 0 || neighborX >= width) continue;
+          if (!selected[neighborY * width + neighborX]) continue;
+          const absoluteX = Math.abs(offsetX);
+          const absoluteY = Math.abs(offsetY);
+          let direction: number;
+          if (absoluteY * 2 < absoluteX) {
+            direction = offsetX > 0 ? 0 : 4;
+          } else if (absoluteX * 2 < absoluteY) {
+            direction = offsetY > 0 ? 2 : 6;
+          } else if (offsetX > 0) {
+            direction = offsetY > 0 ? 1 : 7;
+          } else {
+            direction = offsetY > 0 ? 3 : 5;
+          }
+          directions |= 1 << direction;
+        }
+      }
+      if (
+        ((directions & (1 << 0)) && (directions & (1 << 4)))
+        || ((directions & (1 << 1)) && (directions & (1 << 5)))
+        || ((directions & (1 << 2)) && (directions & (1 << 6)))
+        || ((directions & (1 << 3)) && (directions & (1 << 7)))
+      ) additions[index] = 1;
+    }
+  }
+  for (let index = 0; index < pixelCount; index += 1) {
+    if (additions[index]) selected[index] = 1;
+  }
+
   // Close pinholes without flooding across genuine transparent gaps, such as
   // the spaces between fingers.
-  const additions = new Uint8Array(pixelCount);
   for (let pass = 0; pass < 2; pass += 1) {
     additions.fill(0);
     for (let y = 1; y < height - 1; y += 1) {
