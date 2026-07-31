@@ -18,7 +18,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { createMagicSelectionMask } from "../lib/backgroundRemoval";
+import { createMagicSelectionMask } from "../lib/magicSelection";
 import type { ProcessedItem } from "../types";
 import { Button } from "./ui";
 
@@ -561,6 +561,278 @@ export function RefineEditor({
     setMagicEditMode("remove");
     setMagicStatus("Highlight ready");
     setError("");
+  }, [clearMagicSelection]);
+
+  const createAiMagicSelection = useCallback(async (
+    points: MagicPoint[],
+  ) => {
+    const canvas = canvasRef.current;
+    const magicCanvas = magicCanvasRef.current;
+    const workContext = canvas?.getContext(
+      "2d",
+      { willReadFrequently:true },
+    );
+    const magicContext = magicCanvas?.getContext(
+      "2d",
+      { willReadFrequently:true },
+    );
+    if (
+      !canvas
+      || !magicCanvas
+      || !workContext
+      || !magicContext
+      || !points.length
+    ) return;
+
+    let minimumX = canvas.width;
+    let minimumY = canvas.height;
+    let maximumX = 0;
+    let maximumY = 0;
+    let maximumRadius = 0;
+    for (const point of points) {
+      minimumX = Math.min(minimumX, point.x - point.radius);
+      minimumY = Math.min(minimumY, point.y - point.radius);
+      maximumX = Math.max(maximumX, point.x + point.radius);
+      maximumY = Math.max(maximumY, point.y + point.radius);
+      maximumRadius = Math.max(maximumRadius, point.radius);
+    }
+    const strokeWidth = Math.max(1, maximumX - minimumX);
+    const strokeHeight = Math.max(1, maximumY - minimumY);
+    const padding = Math.max(
+      48,
+      maximumRadius * 2.5,
+      Math.max(strokeWidth, strokeHeight) * 0.45,
+    );
+    let left = clamp(
+      Math.floor(minimumX - padding),
+      0,
+      canvas.width - 1,
+    );
+    let top = clamp(
+      Math.floor(minimumY - padding),
+      0,
+      canvas.height - 1,
+    );
+    let right = clamp(
+      Math.ceil(maximumX + padding),
+      left + 1,
+      canvas.width,
+    );
+    let bottom = clamp(
+      Math.ceil(maximumY + padding),
+      top + 1,
+      canvas.height,
+    );
+    const minimumCropEdge = Math.max(192, Math.ceil(maximumRadius * 6));
+    const expandAxis = (
+      start: number,
+      end: number,
+      limit: number,
+    ) => {
+      const needed = Math.min(limit, minimumCropEdge) - (end - start);
+      if (needed <= 0) return [start, end] as const;
+      const before = Math.min(start, Math.ceil(needed / 2));
+      const after = Math.min(limit - end, needed - before);
+      const remaining = needed - before - after;
+      return [
+        Math.max(0, start - before - remaining),
+        Math.min(limit, end + after),
+      ] as const;
+    };
+    [left, right] = expandAxis(left, right, canvas.width);
+    [top, bottom] = expandAxis(top, bottom, canvas.height);
+
+    const cropWidth = right - left;
+    const cropHeight = bottom - top;
+    const analysisScale = Math.min(
+      1,
+      1024 / Math.max(cropWidth, cropHeight),
+    );
+    const analysisWidth = Math.max(
+      2,
+      Math.round(cropWidth * analysisScale),
+    );
+    const analysisHeight = Math.max(
+      2,
+      Math.round(cropHeight * analysisScale),
+    );
+    const cropCanvas = document.createElement("canvas");
+    cropCanvas.width = analysisWidth;
+    cropCanvas.height = analysisHeight;
+    const cropContext = cropCanvas.getContext("2d");
+    if (!cropContext) {
+      setError("Unable to prepare the AI selection.");
+      return;
+    }
+    // The model sees the current cutout, not the discarded original
+    // background. Transparent finger gaps therefore remain real background.
+    cropContext.fillStyle = "#f4f4f5";
+    cropContext.fillRect(0, 0, analysisWidth, analysisHeight);
+    cropContext.drawImage(
+      canvas,
+      left,
+      top,
+      cropWidth,
+      cropHeight,
+      0,
+      0,
+      analysisWidth,
+      analysisHeight,
+    );
+
+    magicAbortRef.current?.abort();
+    const controller = new AbortController();
+    magicAbortRef.current = controller;
+    setAnalyzing(true);
+    setHasMagicSelection(false);
+    setError("");
+    setMagicStatus("Preparing AI selection");
+
+    try {
+      const cropBitmap = await createImageBitmap(cropCanvas);
+      if (controller.signal.aborted) {
+        cropBitmap.close();
+        return;
+      }
+      const result = await createMagicSelectionMask(
+        cropBitmap,
+        points.map(point => ({
+          x:(point.x - left) * analysisScale,
+          y:(point.y - top) * analysisScale,
+          radius:Math.max(1, point.radius * analysisScale),
+        })),
+        controller.signal,
+        update => setMagicStatus(update.stage),
+      );
+      if (controller.signal.aborted) return;
+      if (
+        result.width !== analysisWidth
+        || result.height !== analysisHeight
+        || result.mask.length !== analysisWidth * analysisHeight
+      ) throw new Error("The AI returned an invalid selection mask.");
+
+      const visibleCanvas = document.createElement("canvas");
+      visibleCanvas.width = analysisWidth;
+      visibleCanvas.height = analysisHeight;
+      const visibleContext = visibleCanvas.getContext(
+        "2d",
+        { willReadFrequently:true },
+      );
+      if (!visibleContext) {
+        throw new Error("Unable to inspect the AI selection.");
+      }
+      visibleContext.drawImage(
+        canvas,
+        left,
+        top,
+        cropWidth,
+        cropHeight,
+        0,
+        0,
+        analysisWidth,
+        analysisHeight,
+      );
+      const visiblePixels = visibleContext.getImageData(
+        0,
+        0,
+        analysisWidth,
+        analysisHeight,
+      ).data;
+      const preview = document.createElement("canvas");
+      preview.width = analysisWidth;
+      preview.height = analysisHeight;
+      const previewContext = preview.getContext("2d");
+      if (!previewContext) {
+        throw new Error("Unable to preview the AI selection.");
+      }
+      const previewPixels = previewContext.createImageData(
+        analysisWidth,
+        analysisHeight,
+      );
+      let selectedPixelCount = 0;
+      for (let index = 0; index < result.mask.length; index += 1) {
+        const offset = index * 4;
+        if (
+          result.mask[index] < MAGIC_MASK_ALPHA_THRESHOLD
+          || visiblePixels[offset + 3] <= 4
+        ) continue;
+        previewPixels.data[offset] = 83;
+        previewPixels.data[offset + 1] = 218;
+        previewPixels.data[offset + 2] = 190;
+        previewPixels.data[offset + 3] = 255;
+        selectedPixelCount += 1;
+      }
+      if (!selectedPixelCount) {
+        throw new Error(
+          "The AI could not recognize an object under that stroke.",
+        );
+      }
+      previewContext.putImageData(previewPixels, 0, 0);
+
+      magicContext.clearRect(
+        0,
+        0,
+        magicCanvas.width,
+        magicCanvas.height,
+      );
+      magicContext.imageSmoothingEnabled = true;
+      magicContext.drawImage(
+        preview,
+        0,
+        0,
+        analysisWidth,
+        analysisHeight,
+        left,
+        top,
+        cropWidth,
+        cropHeight,
+      );
+      const fullResolutionMask = magicContext.getImageData(
+        left,
+        top,
+        cropWidth,
+        cropHeight,
+      );
+      const fullResolutionVisible = workContext.getImageData(
+        left,
+        top,
+        cropWidth,
+        cropHeight,
+      ).data;
+      for (
+        let offset = 3;
+        offset < fullResolutionMask.data.length;
+        offset += 4
+      ) {
+        fullResolutionMask.data[offset] =
+          fullResolutionMask.data[offset] >= MAGIC_MASK_ALPHA_THRESHOLD
+            && fullResolutionVisible[offset] > 4
+            ? 255
+            : 0;
+      }
+      magicContext.putImageData(fullResolutionMask, left, top);
+      magicSelectionRef.current = { left, top, right, bottom };
+      setHasMagicSelection(true);
+      setMagicEditMode("remove");
+      setMagicStatus("AI selection ready");
+    } catch (reason) {
+      if (
+        !(reason instanceof DOMException && reason.name === "AbortError")
+        && !controller.signal.aborted
+      ) {
+        clearMagicSelection();
+        setError(
+          reason instanceof Error
+            ? reason.message
+            : "Unable to create the AI selection.",
+        );
+      }
+    } finally {
+      if (magicAbortRef.current === controller) {
+        magicAbortRef.current = undefined;
+        setAnalyzing(false);
+      }
+    }
   }, [clearMagicSelection]);
 
   const analyzeMagicSelection = useCallback(async (points: MagicPoint[]) => {
@@ -1469,7 +1741,7 @@ export function RefineEditor({
     pointerActionRef.current = undefined;
     if (action.type === "magic") {
       if (event.type === "pointerup") {
-        commitPaintedMagicSelection(action.points);
+        void createAiMagicSelection(action.points);
       } else {
         clearMagicSelection();
       }
@@ -1530,10 +1802,10 @@ export function RefineEditor({
               onClick={() => selectTool("magic")}
               aria-pressed={tool === "magic"}
               disabled={isAnalyzing}
-              title="Paint visible pixels to highlight them (W)"
+              title="Paint a hint for AI selection (W)"
             >
               <WandSparkles size={17} />
-              <span>Smart Select</span>
+              <span>AI Select</span>
             </button>
             <button
               type="button"
@@ -1751,7 +2023,7 @@ export function RefineEditor({
                   : tool === "move"
                     ? "Drag to move. Scroll to zoom."
                     : tool === "magic"
-                      ? "Paint over visible pixels. Transparent gaps stay excluded."
+                      ? "Paint loosely over a part. AI will recognize and highlight it."
                       : "Paint over the image. Use [ and ] to resize the brush."
             )}
           </p>
