@@ -6,11 +6,24 @@ import {
   type ProgressInfo,
 } from '@huggingface/transformers'
 
-type WorkerRequest = {
-  type: 'remove-background'
-  id: string
-  image: Blob
+type MagicMaskSeed = {
+  x: number
+  y: number
+  radius: number
 }
+
+type WorkerRequest =
+  | {
+      type: 'remove-background'
+      id: string
+      image: Blob
+    }
+  | {
+      type: 'select-region'
+      id: string
+      image: ImageBitmap
+      seeds: MagicMaskSeed[]
+    }
 
 const workerScope = self as unknown as DedicatedWorkerGlobalScope
 const MODEL_ID = 'studioludens/birefnet-lite-512'
@@ -81,6 +94,10 @@ const COLOR_ISLAND_MAX_CLEARANCE_FRACTION = 0.08
 const COLOR_ISLAND_GROWTH_PADDING = 12
 const COLOR_ISLAND_EXPANSION_RADIUS = 0
 const COLOR_ISLAND_FEATHER_RADIUS = 2
+const MAGIC_SELECTION_THRESHOLD = 32
+const MAGIC_COMPONENT_PADDING = 0.1
+const MAGIC_HINT_PADDING_SCALE = 2.5
+const MAGIC_MAX_COMPONENT_TO_HINT_AREA_RATIO = 4
 const ALPHA_FILTER_RADIUS = 2
 const ALPHA_FILTER_PASSES = 2
 const MAX_COLOR_EDGE_RADIUS = 24
@@ -134,7 +151,9 @@ env.allowRemoteModels = false
 env.allowLocalModels = true
 env.useBrowserCache = false
 env.localModelPath = new URL('/models/', workerScope.location.href).href
-if (env.backends.onnx.wasm) env.backends.onnx.wasm.numThreads = 1
+// Let ONNX Runtime use multiple CPU cores when the host is cross-origin
+// isolated; it automatically falls back to one thread when that is unavailable.
+if (env.backends.onnx.wasm) env.backends.onnx.wasm.numThreads = 0
 
 function report(id: string, progress: number, stage: string) {
   workerScope.postMessage({
@@ -145,9 +164,11 @@ function report(id: string, progress: number, stage: string) {
   })
 }
 
-function createEngine(id: string) {
+type InferenceDevice = 'webgpu' | 'wasm'
+
+function createEngine(id: string, device: InferenceDevice) {
   const options = {
-      device:'wasm',
+      device,
       dtype:'fp16',
       progress_callback: (update: ProgressInfo) => {
         const percent = (
@@ -160,13 +181,27 @@ function createEngine(id: string) {
   return Promise.all([
     AutoImageProcessor.from_pretrained(MODEL_ID, options),
     AutoModel.from_pretrained(MODEL_ID, options),
-  ]).then(([processor, model]) => ({ processor, model }))
+  ]).then(([processor, model]) => ({ processor, model, device }))
 }
 
 let enginePromise: ReturnType<typeof createEngine> | undefined
 
 function getEngine(id: string) {
-  return enginePromise ??= createEngine(id)
+  if (enginePromise) return enginePromise
+  const canUseWebGpu = 'gpu' in workerScope.navigator
+  enginePromise = canUseWebGpu
+    ? createEngine(id, 'webgpu').catch(() => {
+        report(id, 0.08, 'Using compatible CPU acceleration')
+        return createEngine(id, 'wasm')
+      })
+    : createEngine(id, 'wasm')
+  return enginePromise
+}
+
+function switchToWasmEngine(id: string) {
+  report(id, 0.08, 'Using compatible CPU acceleration')
+  enginePromise = createEngine(id, 'wasm')
+  return enginePromise
 }
 
 function createInferenceCanvas(
@@ -212,6 +247,26 @@ async function inferMask(
     throw new Error('The background-removal model returned no mask.')
   }
   return RawImage.fromTensor(output[0].sigmoid().mul(255).to('uint8'))
+}
+
+async function inferMaskWithFallback(
+  id: string,
+  engine: Awaited<ReturnType<typeof createEngine>>,
+  canvas: OffscreenCanvas,
+) {
+  try {
+    return {
+      engine,
+      mask:await inferMask(engine, canvas),
+    }
+  } catch (error) {
+    if (engine.device !== 'webgpu') throw error
+    const fallback = await switchToWasmEngine(id)
+    return {
+      engine:fallback,
+      mask:await inferMask(fallback, canvas),
+    }
+  }
 }
 
 function findMaskComponents(
@@ -532,6 +587,169 @@ function rectOverlap(first: SourceRect, second: SourceRect) {
     + second.width * second.height
     - intersection
   return intersection / union
+}
+
+function rectsIntersect(first: SourceRect, second: SourceRect) {
+  return (
+    first.left < second.left + second.width
+    && first.left + first.width > second.left
+    && first.top < second.top + second.height
+    && first.top + first.height > second.top
+  )
+}
+
+function createMagicHintRect(
+  seeds: MagicMaskSeed[],
+  imageWidth: number,
+  imageHeight: number,
+) {
+  let left = imageWidth
+  let top = imageHeight
+  let right = 0
+  let bottom = 0
+  let maximumRadius = 1
+  for (const seed of seeds) {
+    const radius = Math.max(1, seed.radius)
+    maximumRadius = Math.max(maximumRadius, radius)
+    left = Math.min(left, seed.x - radius)
+    top = Math.min(top, seed.y - radius)
+    right = Math.max(right, seed.x + radius)
+    bottom = Math.max(bottom, seed.y + radius)
+  }
+  const padding = Math.max(24, maximumRadius * MAGIC_HINT_PADDING_SCALE)
+  left = Math.max(0, Math.floor(left - padding))
+  top = Math.max(0, Math.floor(top - padding))
+  right = Math.min(imageWidth, Math.ceil(right + padding))
+  bottom = Math.min(imageHeight, Math.ceil(bottom + padding))
+  return {
+    left,
+    top,
+    width:Math.max(1, right - left),
+    height:Math.max(1, bottom - top),
+  }
+}
+
+function findSeededMagicComponent(
+  mask: RawImage,
+  imageWidth: number,
+  imageHeight: number,
+  seeds: MagicMaskSeed[],
+) {
+  const pixelCount = mask.width * mask.height
+  const seedMask = new Uint8Array(pixelCount)
+  for (const seed of seeds) {
+    const centerX = seed.x / imageWidth * mask.width
+    const centerY = seed.y / imageHeight * mask.height
+    const radiusX = Math.max(1, seed.radius / imageWidth * mask.width)
+    const radiusY = Math.max(1, seed.radius / imageHeight * mask.height)
+    const left = Math.max(0, Math.floor(centerX - radiusX))
+    const top = Math.max(0, Math.floor(centerY - radiusY))
+    const right = Math.min(mask.width - 1, Math.ceil(centerX + radiusX))
+    const bottom = Math.min(mask.height - 1, Math.ceil(centerY + radiusY))
+    for (let y = top; y <= bottom; y += 1) {
+      const normalizedY = (y + 0.5 - centerY) / radiusY
+      for (let x = left; x <= right; x += 1) {
+        const normalizedX = (x + 0.5 - centerX) / radiusX
+        if (
+          normalizedX * normalizedX + normalizedY * normalizedY <= 1
+        ) {
+          seedMask[y * mask.width + x] = 1
+        }
+      }
+    }
+  }
+
+  let paintedAlpha = 0
+  let paintedCount = 0
+  for (let index = 0; index < pixelCount; index += 1) {
+    if (!seedMask[index]) continue
+    paintedAlpha += mask.data[index]
+    paintedCount += 1
+  }
+  if (!paintedCount) return undefined
+  const selectForeground = paintedAlpha / paintedCount >= 127.5
+  const candidates = new Uint8Array(pixelCount)
+  const selected = new Uint8Array(pixelCount)
+  const queue = new Int32Array(pixelCount)
+  let write = 0
+
+  for (let index = 0; index < pixelCount; index += 1) {
+    const sideStrength = selectForeground
+      ? mask.data[index]
+      : 255 - mask.data[index]
+    if (sideStrength < MAGIC_SELECTION_THRESHOLD) continue
+    candidates[index] = 1
+    if (seedMask[index]) {
+      selected[index] = 1
+      queue[write++] = index
+    }
+  }
+  if (!write) return undefined
+
+  let minX = mask.width
+  let minY = mask.height
+  let maxX = -1
+  let maxY = -1
+  for (let read = 0; read < write; read += 1) {
+    const index = queue[read]
+    const x = index % mask.width
+    const y = Math.floor(index / mask.width)
+    minX = Math.min(minX, x)
+    minY = Math.min(minY, y)
+    maxX = Math.max(maxX, x)
+    maxY = Math.max(maxY, y)
+
+    if (x > 0) {
+      const neighbor = index - 1
+      if (!selected[neighbor] && candidates[neighbor]) {
+        selected[neighbor] = 1
+        queue[write++] = neighbor
+      }
+    }
+    if (x < mask.width - 1) {
+      const neighbor = index + 1
+      if (!selected[neighbor] && candidates[neighbor]) {
+        selected[neighbor] = 1
+        queue[write++] = neighbor
+      }
+    }
+    if (y > 0) {
+      const neighbor = index - mask.width
+      if (!selected[neighbor] && candidates[neighbor]) {
+        selected[neighbor] = 1
+        queue[write++] = neighbor
+      }
+    }
+    if (y < mask.height - 1) {
+      const neighbor = index + mask.width
+      if (!selected[neighbor] && candidates[neighbor]) {
+        selected[neighbor] = 1
+        queue[write++] = neighbor
+      }
+    }
+  }
+
+  let left = Math.floor(minX / mask.width * imageWidth)
+  let top = Math.floor(minY / mask.height * imageHeight)
+  let right = Math.ceil((maxX + 1) / mask.width * imageWidth)
+  let bottom = Math.ceil((maxY + 1) / mask.height * imageHeight)
+  const padding = Math.max(
+    4,
+    Math.round(Math.max(right - left, bottom - top) * MAGIC_COMPONENT_PADDING),
+  )
+  left = Math.max(0, left - padding)
+  top = Math.max(0, top - padding)
+  right = Math.min(imageWidth, right + padding)
+  bottom = Math.min(imageHeight, bottom + padding)
+  return {
+    selectForeground,
+    source:{
+      left,
+      top,
+      width:Math.max(1, right - left),
+      height:Math.max(1, bottom - top),
+    },
+  }
 }
 
 function summedArea(
@@ -1753,11 +1971,54 @@ function decontaminateEdgeColors(
   }
 }
 
+function findAllRefinementLayers(
+  baseMask: RawImage,
+  imageWidth: number,
+  imageHeight: number,
+) {
+  const personLayers = findPersonRefinementLayers(
+    baseMask,
+    imageWidth,
+    imageHeight,
+  )
+  const structuralLayers = personLayers.length >= 2
+    ? personLayers
+    : findRefinementRects(
+        baseMask,
+        imageWidth,
+        imageHeight,
+      ).map(source => ({ source, detail:'person' as const }))
+  const edgeLayers = findEdgeRefinementLayers(
+    baseMask,
+    imageWidth,
+    imageHeight,
+  ).filter(candidate => !structuralLayers.some(existing => {
+    const existingArea = existing.source.width * existing.source.height
+    const candidateArea = candidate.source.width * candidate.source.height
+    const areaRatio = Math.min(existingArea, candidateArea)
+      / Math.max(existingArea, candidateArea)
+    return (
+      areaRatio >= REFINEMENT_DUPLICATE_AREA_RATIO
+      && rectOverlap(existing.source, candidate.source)
+        >= REFINEMENT_DUPLICATE_OVERLAP
+    )
+  }))
+  const structuralBudget = Math.max(
+    0,
+    MAX_TOTAL_REFINEMENT_PASSES - edgeLayers.length,
+  )
+  return [
+    ...structuralLayers.slice(0, structuralBudget),
+    ...edgeLayers,
+  ]
+}
+
 function applyFullResolutionAlpha(
   context: OffscreenCanvasRenderingContext2D,
   imageWidth: number,
   imageHeight: number,
   layers: MaskLayer[],
+  outputMode: 'image' | 'mask' = 'image',
 ) {
   const pixels = context.getImageData(0, 0, imageWidth, imageHeight)
   const data = pixels.data
@@ -1846,13 +2107,15 @@ function applyFullResolutionAlpha(
   // Clean color spill while the edge is still a soft matte. Once polishAlpha
   // hardens that transition, contaminated pixels may become fully opaque and
   // are no longer distinguishable from true subject color.
-  decontaminateEdgeColors(
-    data,
-    alpha,
-    imageWidth,
-    imageHeight,
-    decontaminationRadius,
-  )
+  if (outputMode === 'image') {
+    decontaminateEdgeColors(
+      data,
+      alpha,
+      imageWidth,
+      imageHeight,
+      decontaminationRadius,
+    )
+  }
 
   // Tight head and boundary crops carry substantially more strand information
   // than the broad subject pass. Keep their partial alpha instead of applying
@@ -1902,20 +2165,35 @@ function applyFullResolutionAlpha(
     alpha[index] = Math.round(alpha[index] * data[offset + 3] / 255)
   }
 
-  for (let index = 0; index < alpha.length; index += 1) {
-    data[index * 4 + 3] = alpha[index]
+  if (outputMode === 'image') {
+    for (let index = 0; index < alpha.length; index += 1) {
+      data[index * 4 + 3] = alpha[index]
+    }
+    context.putImageData(pixels, 0, 0)
   }
-  context.putImageData(pixels, 0, 0)
+  return alpha
 }
 
 workerScope.onmessage = async ({ data }: MessageEvent<WorkerRequest>) => {
-  if (data.type !== 'remove-background') return
   let bitmap: ImageBitmap | undefined
   try {
-    report(data.id, 0.02, 'Starting background-removal engine')
-    const engine = await getEngine(data.id)
-    report(data.id, 0.47, 'Decoding source image')
-    bitmap = await createImageBitmap(data.image)
+    const isMagicSelection = data.type === 'select-region'
+    report(
+      data.id,
+      0.02,
+      isMagicSelection
+        ? 'Starting fast AI selection'
+        : 'Starting background-removal engine',
+    )
+    let engine = await getEngine(data.id)
+    report(
+      data.id,
+      0.47,
+      isMagicSelection ? 'Reading painted area' : 'Decoding source image',
+    )
+    bitmap = data.type === 'select-region'
+      ? data.image
+      : await createImageBitmap(data.image)
 
     const wholeImage = {
       left:0,
@@ -1923,83 +2201,114 @@ workerScope.onmessage = async ({ data }: MessageEvent<WorkerRequest>) => {
       width:bitmap.width,
       height:bitmap.height,
     }
-    report(data.id, 0.53, 'Finding the foreground')
-    const baseMask = await inferMask(
+    report(
+      data.id,
+      0.53,
+      isMagicSelection ? 'Finding the painted region' : 'Finding the foreground',
+    )
+    const baseInference = await inferMaskWithFallback(
+      data.id,
       engine,
       createInferenceCanvas(bitmap, wholeImage),
     )
+    engine = baseInference.engine
+    const baseMask = baseInference.mask
     const layers: MaskLayer[] = [{ mask:baseMask, source:wholeImage }]
-    const personLayers = findPersonRefinementLayers(
+    let refinementLayers = findAllRefinementLayers(
       baseMask,
       bitmap.width,
       bitmap.height,
     )
-    const structuralLayers = personLayers.length >= 2
-      ? personLayers
-      : findRefinementRects(
-          baseMask,
-          bitmap.width,
-          bitmap.height,
-        ).map(source => ({ source, detail:'person' as const }))
-    const edgeLayers = findEdgeRefinementLayers(
-      baseMask,
-      bitmap.width,
-      bitmap.height,
-    ).filter(candidate => !structuralLayers.some(existing => {
-      const existingArea = existing.source.width * existing.source.height
-      const candidateArea = candidate.source.width * candidate.source.height
-      const areaRatio = Math.min(existingArea, candidateArea)
-        / Math.max(existingArea, candidateArea)
-      return (
-        areaRatio >= REFINEMENT_DUPLICATE_AREA_RATIO
-        && rectOverlap(existing.source, candidate.source)
-          >= REFINEMENT_DUPLICATE_OVERLAP
+    if (isMagicSelection) {
+      // The final UI selection is seed-connected, so refinements that cannot
+      // touch that component only add latency without changing its result.
+      const hintRect = createMagicHintRect(
+        data.seeds,
+        bitmap.width,
+        bitmap.height,
       )
-    }))
-    const structuralBudget = Math.max(
-      0,
-      MAX_TOTAL_REFINEMENT_PASSES - edgeLayers.length,
-    )
-    const refinementLayers = [
-      ...structuralLayers.slice(0, structuralBudget),
-      ...edgeLayers,
-    ]
+      const seededComponent = findSeededMagicComponent(
+        baseMask,
+        bitmap.width,
+        bitmap.height,
+        data.seeds,
+      )
+      const componentArea = seededComponent
+        ? seededComponent.source.width * seededComponent.source.height
+        : Number.POSITIVE_INFINITY
+      const hintArea = hintRect.width * hintRect.height
+      const focusRect = (
+        seededComponent?.selectForeground
+        && componentArea
+          <= hintArea * MAGIC_MAX_COMPONENT_TO_HINT_AREA_RATIO
+      )
+        ? seededComponent.source
+        : hintRect
+      refinementLayers = refinementLayers.filter(
+        layer => rectsIntersect(layer.source, focusRect),
+      )
+    }
+
     for (let index = 0; index < refinementLayers.length; index += 1) {
       const refinementLayer = refinementLayers[index]
-      const stage = refinementLayer.detail === 'hair'
-        ? 'Refining hair and upper-body gaps'
-        : refinementLayer.detail === 'edge'
-          ? 'Refining high-quality hair and fur edges'
-          : `Refining subject ${index + 1} of ${refinementLayers.length}`
+      const stage = isMagicSelection
+        ? `Refining painted edge ${index + 1} of ${refinementLayers.length}`
+        : refinementLayer.detail === 'hair'
+          ? 'Refining hair and upper-body gaps'
+          : refinementLayer.detail === 'edge'
+            ? 'Refining high-quality hair and fur edges'
+            : `Refining subject ${index + 1} of ${refinementLayers.length}`
       report(
         data.id,
         0.68 + (index / refinementLayers.length) * 0.16,
         stage,
       )
-      const inferredMask = await inferMask(
+      const refinementInference = await inferMaskWithFallback(
+        data.id,
         engine,
         createInferenceCanvas(bitmap, refinementLayer.source),
       )
+      engine = refinementInference.engine
+      const inferredMask = refinementInference.mask
       const refinedMask = refinementLayer.detail === 'hair'
         ? expandEnclosedBackgroundPockets(inferredMask)
         : inferredMask
       layers.push({ mask:refinedMask, ...refinementLayer })
     }
 
-    report(data.id, 0.86, 'Snapping the matte to full-resolution edges')
+    report(
+      data.id,
+      0.86,
+      isMagicSelection
+        ? 'Snapping highlight to image edges'
+        : 'Snapping the matte to full-resolution edges',
+    )
     const outputCanvas = new OffscreenCanvas(bitmap.width, bitmap.height)
     const outputContext = outputCanvas.getContext('2d', { alpha:true })
     if (!outputContext) {
       throw new Error('Unable to create the transparent output image.')
     }
     outputContext.drawImage(bitmap, 0, 0)
-    applyFullResolutionAlpha(
+    const alpha = applyFullResolutionAlpha(
       outputContext,
       bitmap.width,
       bitmap.height,
       layers,
+      isMagicSelection ? 'mask' : 'image',
     )
 
+    if (isMagicSelection) {
+      const maskBuffer = alpha.buffer as ArrayBuffer
+      report(data.id, 0.98, 'Highlight ready')
+      workerScope.postMessage({
+        type:'mask-result',
+        id:data.id,
+        mask:maskBuffer,
+        width:bitmap.width,
+        height:bitmap.height,
+      }, [maskBuffer])
+      return
+    }
     const blob = await outputCanvas.convertToBlob({ type:'image/png' })
     report(data.id, 0.98, 'Finishing transparent PNG')
     workerScope.postMessage({

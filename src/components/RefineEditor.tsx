@@ -8,6 +8,7 @@ import {
   Plus,
   RotateCcw,
   Undo2,
+  WandSparkles,
   X,
 } from "lucide-react";
 import {
@@ -17,10 +18,26 @@ import {
   useRef,
   useState,
 } from "react";
+import { createMagicSelectionMask } from "../lib/magicSelection";
+import { refineMagicSelectionMask } from "../lib/magicSelectionRefinement";
 import type { ProcessedItem } from "../types";
 import { Button } from "./ui";
 
-type RefineTool = "restore" | "erase" | "move";
+type RefineTool = "restore" | "erase" | "magic" | "move";
+type MagicEditMode = "add" | "remove";
+
+type MagicPoint = {
+  x: number;
+  y: number;
+  radius: number;
+};
+
+type MagicSelection = {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+};
 
 type UndoTile = {
   x: number;
@@ -33,12 +50,29 @@ type ActiveStroke = {
   seenTiles: Set<number>;
 };
 
+type CanvasPointerMap = {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+  scaleX: number;
+  scaleY: number;
+  radius: number;
+};
+
+type PendingBrushMove = {
+  pointerId: number;
+  clientX: number;
+  clientY: number;
+};
+
 type PointerAction =
   | {
       type: "paint";
       pointerId: number;
       lastX: number;
       lastY: number;
+      map: CanvasPointerMap;
     }
   | {
       type: "pan";
@@ -47,6 +81,23 @@ type PointerAction =
       startY: number;
       originX: number;
       originY: number;
+    }
+  | {
+      type: "magic";
+      pointerId: number;
+      lastX: number;
+      lastY: number;
+      points: MagicPoint[];
+      map: CanvasPointerMap;
+    }
+  | {
+      type: "magic-edit";
+      pointerId: number;
+      lastX: number;
+      lastY: number;
+      mode: MagicEditMode;
+      map: CanvasPointerMap;
+      dirtyTiles: Set<number>;
     };
 
 type LoadedImage = {
@@ -58,6 +109,24 @@ const MIN_ZOOM = 1;
 const MAX_ZOOM = 8;
 const UNDO_LIMIT = 12;
 const UNDO_TILE_SIZE = 128;
+const MAGIC_EDIT_TILE_SIZE = 256;
+const MAGIC_MASK_ALPHA_THRESHOLD = 128;
+const MAGIC_HINT_CORE_RADIUS_SCALE = 0.26;
+const MAGIC_GROWTH_RADIUS_SCALE = 1.08;
+const MAGIC_ENDPOINT_GROWTH_RADIUS_SCALE = 1;
+const MAGIC_ENDPOINT_TAPER_DISTANCE_SCALE = 0.9;
+const MAGIC_POINT_COLOR_TOLERANCE = 76;
+const MAGIC_POINT_LUMINANCE_TOLERANCE = 58;
+const MAGIC_POINT_CHROMA_TOLERANCE = 42;
+const MAGIC_POINT_MODEL_TOLERANCE = 104;
+const MAGIC_SOFT_COLOR_TOLERANCE = 98;
+const MAGIC_SOFT_LUMINANCE_TOLERANCE = 74;
+const MAGIC_SOFT_CHROMA_TOLERANCE = 58;
+const MAGIC_SOFT_MODEL_TOLERANCE = 136;
+const MAGIC_HOLE_FILL_PASSES = 1;
+const MAGIC_LOCAL_EDGE_COLOR_TOLERANCE = 68;
+const MAGIC_LOCAL_EDGE_ALPHA_TOLERANCE = 64;
+const MAGIC_LOCAL_EDGE_MODEL_TOLERANCE = 104;
 
 function loadImage(blob: Blob): Promise<LoadedImage> {
   return new Promise((resolve, reject) => {
@@ -90,6 +159,424 @@ function clamp(value: number, minimum: number, maximum: number) {
   return Math.min(maximum, Math.max(minimum, value));
 }
 
+function refineAiSelectionPixels(
+  maskPixels: ImageData,
+  visiblePixels: Uint8ClampedArray,
+  width: number,
+  height: number,
+  points: MagicPoint[],
+  cropLeft: number,
+  cropTop: number,
+) {
+  const pixelCount = width * height;
+  const selected = new Uint8Array(pixelCount);
+  const painted = new Uint8Array(pixelCount);
+  const isVisible = (index: number) => visiblePixels[index * 4 + 3] > 0;
+
+  for (let index = 0; index < pixelCount; index += 1) {
+    if (
+      maskPixels.data[index * 4 + 3] >= MAGIC_MASK_ALPHA_THRESHOLD
+      && isVisible(index)
+    ) selected[index] = 1;
+  }
+
+  // Keep a narrow record of the stroke centerline for cleanup guidance. It is
+  // deliberately not merged into the output: the AI mask, not the brush
+  // footprint, remains the selection.
+  let maximumPaintRadius = 1;
+  for (const point of points) {
+    const centerX = point.x - cropLeft;
+    const centerY = point.y - cropTop;
+    maximumPaintRadius = Math.max(maximumPaintRadius, point.radius);
+    const coreRadius = Math.max(1.5, point.radius * 0.32);
+    const radiusSquared = coreRadius * coreRadius;
+    const pointLeft = Math.max(0, Math.floor(centerX - coreRadius));
+    const pointTop = Math.max(0, Math.floor(centerY - coreRadius));
+    const pointRight = Math.min(width - 1, Math.ceil(centerX + coreRadius));
+    const pointBottom = Math.min(height - 1, Math.ceil(centerY + coreRadius));
+    for (let y = pointTop; y <= pointBottom; y += 1) {
+      const dy = y + 0.5 - centerY;
+      for (let x = pointLeft; x <= pointRight; x += 1) {
+        const dx = x + 0.5 - centerX;
+        if (dx * dx + dy * dy > radiusSquared) continue;
+        const index = y * width + x;
+        if (!isVisible(index)) continue;
+        painted[index] = 1;
+      }
+    }
+  }
+
+  // Repair only a break that has recognized mask on opposing sides of the
+  // painted centerline. This closes short internal misses without extending
+  // beyond a finger or reproducing the user's circular brush stamp.
+  const additions = new Uint8Array(pixelCount);
+  const bridgeDistance = clamp(
+    Math.round(maximumPaintRadius * 0.72),
+    3,
+    12,
+  );
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (!painted[index] || selected[index] || !isVisible(index)) continue;
+      let directions = 0;
+      for (
+        let offsetY = -bridgeDistance;
+        offsetY <= bridgeDistance;
+        offsetY += 1
+      ) {
+        const neighborY = y + offsetY;
+        if (neighborY < 0 || neighborY >= height) continue;
+        for (
+          let offsetX = -bridgeDistance;
+          offsetX <= bridgeDistance;
+          offsetX += 1
+        ) {
+          if (!offsetX && !offsetY) continue;
+          if (
+            offsetX * offsetX + offsetY * offsetY
+              > bridgeDistance * bridgeDistance
+          ) continue;
+          const neighborX = x + offsetX;
+          if (neighborX < 0 || neighborX >= width) continue;
+          if (!selected[neighborY * width + neighborX]) continue;
+          const absoluteX = Math.abs(offsetX);
+          const absoluteY = Math.abs(offsetY);
+          let direction: number;
+          if (absoluteY * 2 < absoluteX) {
+            direction = offsetX > 0 ? 0 : 4;
+          } else if (absoluteX * 2 < absoluteY) {
+            direction = offsetY > 0 ? 2 : 6;
+          } else if (offsetX > 0) {
+            direction = offsetY > 0 ? 1 : 7;
+          } else {
+            direction = offsetY > 0 ? 3 : 5;
+          }
+          directions |= 1 << direction;
+        }
+      }
+      if (
+        ((directions & (1 << 0)) && (directions & (1 << 4)))
+        || ((directions & (1 << 1)) && (directions & (1 << 5)))
+        || ((directions & (1 << 2)) && (directions & (1 << 6)))
+        || ((directions & (1 << 3)) && (directions & (1 << 7)))
+      ) additions[index] = 1;
+    }
+  }
+  for (let index = 0; index < pixelCount; index += 1) {
+    if (additions[index]) selected[index] = 1;
+  }
+
+  // Close pinholes without flooding across genuine transparent gaps, such as
+  // the spaces between fingers.
+  for (let pass = 0; pass < 2; pass += 1) {
+    additions.fill(0);
+    for (let y = 1; y < height - 1; y += 1) {
+      for (let x = 1; x < width - 1; x += 1) {
+        const index = y * width + x;
+        if (selected[index] || !isVisible(index)) continue;
+        let neighborCount = 0;
+        for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+          for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+            if (!offsetX && !offsetY) continue;
+            if (selected[index + offsetY * width + offsetX]) {
+              neighborCount += 1;
+            }
+          }
+        }
+        if (neighborCount >= 5) additions[index] = 1;
+      }
+    }
+    for (let index = 0; index < pixelCount; index += 1) {
+      if (additions[index]) selected[index] = 1;
+    }
+  }
+
+  // Keep only mask islands reached by the painted prompt. This removes the
+  // small disconnected flecks that SAM can leave on nearby clothing.
+  const visited = new Uint8Array(pixelCount);
+  const refined = new Uint8Array(pixelCount);
+  const queue = new Int32Array(pixelCount);
+  for (let start = 0; start < pixelCount; start += 1) {
+    if (!selected[start] || visited[start]) continue;
+    let read = 0;
+    let write = 1;
+    let containsPaint = Boolean(painted[start]);
+    queue[0] = start;
+    visited[start] = 1;
+    while (read < write) {
+      const index = queue[read];
+      read += 1;
+      const x = index % width;
+      const y = Math.floor(index / width);
+      for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+        const neighborY = y + offsetY;
+        if (neighborY < 0 || neighborY >= height) continue;
+        for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+          if (!offsetX && !offsetY) continue;
+          const neighborX = x + offsetX;
+          if (neighborX < 0 || neighborX >= width) continue;
+          const neighborIndex = neighborY * width + neighborX;
+          if (!selected[neighborIndex] || visited[neighborIndex]) continue;
+          visited[neighborIndex] = 1;
+          if (painted[neighborIndex]) containsPaint = true;
+          queue[write] = neighborIndex;
+          write += 1;
+        }
+      }
+    }
+    if (!containsPaint) continue;
+    for (let index = 0; index < write; index += 1) {
+      refined[queue[index]] = 1;
+    }
+  }
+
+  // Fill only small, fully enclosed holes. Large unselected regions and gaps
+  // that lead to transparency remain untouched.
+  const maximumHoleArea = clamp(
+    Math.round(maximumPaintRadius * maximumPaintRadius * 0.35),
+    24,
+    512,
+  );
+  visited.fill(0);
+  for (let start = 0; start < pixelCount; start += 1) {
+    if (refined[start] || !isVisible(start) || visited[start]) continue;
+    let read = 0;
+    let write = 1;
+    let touchesExterior = false;
+    queue[0] = start;
+    visited[start] = 1;
+    while (read < write) {
+      const index = queue[read];
+      read += 1;
+      const x = index % width;
+      const y = Math.floor(index / width);
+      for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+        const neighborY = y + offsetY;
+        for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+          if (!offsetX && !offsetY) continue;
+          const neighborX = x + offsetX;
+          if (
+            neighborX < 0
+            || neighborX >= width
+            || neighborY < 0
+            || neighborY >= height
+          ) {
+            touchesExterior = true;
+            continue;
+          }
+          const neighborIndex = neighborY * width + neighborX;
+          if (!isVisible(neighborIndex)) {
+            touchesExterior = true;
+            continue;
+          }
+          if (refined[neighborIndex] || visited[neighborIndex]) continue;
+          visited[neighborIndex] = 1;
+          queue[write] = neighborIndex;
+          write += 1;
+        }
+      }
+    }
+    if (touchesExterior || write > maximumHoleArea) continue;
+    for (let index = 0; index < write; index += 1) {
+      refined[queue[index]] = 1;
+    }
+  }
+
+  // Recover a narrow omitted band only when it lies between the retained AI
+  // mask and actual transparency. Both distance searches stay inside visible
+  // pixels, so this cannot jump across finger gaps or spread into interior
+  // clothing.
+  const maximumEdgeBand = clamp(
+    Math.round(maximumPaintRadius * 0.26),
+    3,
+    8,
+  );
+  const selectionDistance = new Uint8Array(pixelCount);
+  const transparencyDistance = new Uint8Array(pixelCount);
+  selectionDistance.fill(255);
+  transparencyDistance.fill(255);
+  let read = 0;
+  let write = 0;
+  for (let index = 0; index < pixelCount; index += 1) {
+    if (!refined[index]) continue;
+    selectionDistance[index] = 0;
+    queue[write] = index;
+    write += 1;
+  }
+  while (read < write) {
+    const index = queue[read];
+    read += 1;
+    const distance = selectionDistance[index];
+    if (distance >= maximumEdgeBand) continue;
+    const x = index % width;
+    const y = Math.floor(index / width);
+    for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+      const neighborY = y + offsetY;
+      if (neighborY < 0 || neighborY >= height) continue;
+      for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+        if (!offsetX && !offsetY) continue;
+        const neighborX = x + offsetX;
+        if (neighborX < 0 || neighborX >= width) continue;
+        const neighborIndex = neighborY * width + neighborX;
+        if (
+          !isVisible(neighborIndex)
+          || selectionDistance[neighborIndex] <= distance + 1
+        ) continue;
+        selectionDistance[neighborIndex] = distance + 1;
+        queue[write] = neighborIndex;
+        write += 1;
+      }
+    }
+  }
+
+  read = 0;
+  write = 0;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (!isVisible(index)) continue;
+      let touchesTransparency = (
+        x === 0
+        || x === width - 1
+        || y === 0
+        || y === height - 1
+      );
+      if (!touchesTransparency) {
+        for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+          for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+            if (!offsetX && !offsetY) continue;
+            if (!isVisible(index + offsetY * width + offsetX)) {
+              touchesTransparency = true;
+            }
+          }
+        }
+      }
+      if (!touchesTransparency) continue;
+      transparencyDistance[index] = 1;
+      queue[write] = index;
+      write += 1;
+    }
+  }
+  while (read < write) {
+    const index = queue[read];
+    read += 1;
+    const distance = transparencyDistance[index];
+    if (distance >= maximumEdgeBand) continue;
+    const x = index % width;
+    const y = Math.floor(index / width);
+    for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+      const neighborY = y + offsetY;
+      if (neighborY < 0 || neighborY >= height) continue;
+      for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+        if (!offsetX && !offsetY) continue;
+        const neighborX = x + offsetX;
+        if (neighborX < 0 || neighborX >= width) continue;
+        const neighborIndex = neighborY * width + neighborX;
+        if (
+          !isVisible(neighborIndex)
+          || transparencyDistance[neighborIndex] <= distance + 1
+        ) continue;
+        transparencyDistance[neighborIndex] = distance + 1;
+        queue[write] = neighborIndex;
+        write += 1;
+      }
+    }
+  }
+  for (let index = 0; index < pixelCount; index += 1) {
+    if (refined[index] || !isVisible(index)) continue;
+    const fromSelection = selectionDistance[index];
+    const fromTransparency = transparencyDistance[index];
+    if (
+      fromSelection === 255
+      || fromTransparency === 255
+      || fromSelection + fromTransparency > maximumEdgeBand + 1
+    ) continue;
+    refined[index] = 1;
+  }
+
+  // Pick up the last antialiased object pixels along opaque internal
+  // boundaries (for example, a fingertip against dark clothing). Growth is
+  // capped at two pixels and requires a close color/luminance/chroma match to
+  // an already-retained neighbor, so it cannot reproduce the brush footprint.
+  const localEdgeColorToleranceSquared = 118 * 118;
+  for (let pass = 0; pass < 2; pass += 1) {
+    additions.fill(0);
+    for (let y = 1; y < height - 1; y += 1) {
+      for (let x = 1; x < width - 1; x += 1) {
+        const index = y * width + x;
+        if (refined[index] || !isVisible(index)) continue;
+        const offset = index * 4;
+        const red = visiblePixels[offset];
+        const green = visiblePixels[offset + 1];
+        const blue = visiblePixels[offset + 2];
+        const luminance = red * 0.2126 + green * 0.7152 + blue * 0.0722;
+        const chroma = Math.max(red, green, blue) - Math.min(red, green, blue);
+        let matchesRetainedEdge = false;
+        for (
+          let offsetY = -1;
+          offsetY <= 1 && !matchesRetainedEdge;
+          offsetY += 1
+        ) {
+          for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+            if (!offsetX && !offsetY) continue;
+            const neighborIndex = index + offsetY * width + offsetX;
+            if (!refined[neighborIndex]) continue;
+            const neighborOffset = neighborIndex * 4;
+            const neighborRed = visiblePixels[neighborOffset];
+            const neighborGreen = visiblePixels[neighborOffset + 1];
+            const neighborBlue = visiblePixels[neighborOffset + 2];
+            const redDifference = red - neighborRed;
+            const greenDifference = green - neighborGreen;
+            const blueDifference = blue - neighborBlue;
+            if (
+              redDifference * redDifference
+                + greenDifference * greenDifference
+                + blueDifference * blueDifference
+                  > localEdgeColorToleranceSquared
+            ) continue;
+            const neighborLuminance = (
+              neighborRed * 0.2126
+              + neighborGreen * 0.7152
+              + neighborBlue * 0.0722
+            );
+            if (Math.abs(luminance - neighborLuminance) > 72) continue;
+            const neighborChroma = (
+              Math.max(neighborRed, neighborGreen, neighborBlue)
+              - Math.min(neighborRed, neighborGreen, neighborBlue)
+            );
+            if (Math.abs(chroma - neighborChroma) > 48) continue;
+            matchesRetainedEdge = true;
+            break;
+          }
+        }
+        if (matchesRetainedEdge) additions[index] = 1;
+      }
+    }
+    for (let index = 0; index < pixelCount; index += 1) {
+      if (additions[index]) refined[index] = 1;
+    }
+  }
+
+  let selectedPixelCount = 0;
+  for (let index = 0; index < pixelCount; index += 1) {
+    const offset = index * 4;
+    if (!refined[index]) {
+      maskPixels.data[offset] = 0;
+      maskPixels.data[offset + 1] = 0;
+      maskPixels.data[offset + 2] = 0;
+      maskPixels.data[offset + 3] = 0;
+      continue;
+    }
+    maskPixels.data[offset] = 83;
+    maskPixels.data[offset + 1] = 218;
+    maskPixels.data[offset + 2] = 190;
+    maskPixels.data[offset + 3] = 255;
+    selectedPixelCount += 1;
+  }
+  return selectedPixelCount;
+}
+
 export function RefineEditor({
   item,
   onClose,
@@ -101,11 +588,22 @@ export function RefineEditor({
 }) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const magicCanvasRef = useRef<HTMLCanvasElement>(null);
+  const brushCursorRef = useRef<HTMLSpanElement>(null);
+  const viewportBoundsRef = useRef<DOMRect>();
+  const pendingBrushMoveRef = useRef<PendingBrushMove>();
+  const brushFrameRef = useRef<number>();
   const sourceImageRef = useRef<HTMLImageElement>();
   const baselineImageRef = useRef<HTMLImageElement>();
   const pointerActionRef = useRef<PointerAction>();
   const activeStrokeRef = useRef<ActiveStroke>();
+  const magicSelectionRef = useRef<MagicSelection>();
+  const magicAbortRef = useRef<AbortController>();
   const undoRef = useRef<UndoTile[][]>([]);
+  const eraseBrushRef = useRef<{
+    radius: number;
+    canvas: HTMLCanvasElement;
+  }>();
   const [tool, setTool] = useState<RefineTool>("restore");
   const [brushSize, setBrushSize] = useState(64);
   const [zoom, setZoom] = useState(1);
@@ -115,10 +613,14 @@ export function RefineEditor({
     width: item.width ?? 1,
     height: item.height ?? 1,
   });
-  const [cursor, setCursor] = useState({ x: 0, y: 0, visible: false });
   const [isLoading, setLoading] = useState(true);
   const [isReady, setReady] = useState(false);
   const [isSaving, setSaving] = useState(false);
+  const [isAnalyzing, setAnalyzing] = useState(false);
+  const [magicStatus, setMagicStatus] = useState("");
+  const [hasMagicSelection, setHasMagicSelection] = useState(false);
+  const [magicEditMode, setMagicEditMode] =
+    useState<MagicEditMode>("remove");
   const [error, setError] = useState("");
   const [undoCount, setUndoCount] = useState(0);
   const [hasChanges, setHasChanges] = useState(false);
@@ -140,17 +642,189 @@ export function RefineEditor({
   const displayWidth = imageSize.width * fitScale * zoom;
   const displayHeight = imageSize.height * fitScale * zoom;
 
+  const clearMagicSelection = useCallback(() => {
+    const magicCanvas = magicCanvasRef.current;
+    magicCanvas?.getContext("2d")?.clearRect(
+      0,
+      0,
+      magicCanvas.width,
+      magicCanvas.height,
+    );
+    magicSelectionRef.current = undefined;
+    setHasMagicSelection(false);
+    setMagicStatus("");
+  }, []);
+
+  const drawMagicHint = useCallback((
+    fromX: number,
+    fromY: number,
+    toX: number,
+    toY: number,
+    radius: number,
+  ) => {
+    const context = magicCanvasRef.current?.getContext("2d");
+    if (!context) return;
+    context.save();
+    context.fillStyle = "rgba(83, 218, 190, 0.92)";
+    context.strokeStyle = "rgba(83, 218, 190, 0.92)";
+    if (fromX === toX && fromY === toY) {
+      context.beginPath();
+      context.arc(toX, toY, radius, 0, Math.PI * 2);
+      context.fill();
+    } else {
+      context.lineCap = "round";
+      context.lineJoin = "round";
+      context.lineWidth = radius * 2;
+      context.beginPath();
+      context.moveTo(fromX, fromY);
+      context.lineTo(toX, toY);
+      context.stroke();
+    }
+    context.restore();
+  }, []);
+
+  const editMagicSelectionLine = useCallback((
+    fromX: number,
+    fromY: number,
+    toX: number,
+    toY: number,
+    radius: number,
+    mode: MagicEditMode,
+  ) => {
+    const magicCanvas = magicCanvasRef.current;
+    const magicContext = magicCanvas?.getContext("2d");
+    if (!magicCanvas || !magicContext) return;
+    const left = Math.max(
+      0,
+      Math.floor(Math.min(fromX, toX) - radius),
+    );
+    const top = Math.max(
+      0,
+      Math.floor(Math.min(fromY, toY) - radius),
+    );
+    const right = Math.min(
+      magicCanvas.width,
+      Math.ceil(Math.max(fromX, toX) + radius),
+    );
+    const bottom = Math.min(
+      magicCanvas.height,
+      Math.ceil(Math.max(fromY, toY) + radius),
+    );
+    if (right <= left || bottom <= top) return;
+
+    magicContext.save();
+    magicContext.globalCompositeOperation = mode === "add"
+      ? "source-over"
+      : "destination-out";
+    magicContext.fillStyle = "rgba(83, 218, 190, 1)";
+    magicContext.strokeStyle = "rgba(83, 218, 190, 1)";
+    if (fromX === toX && fromY === toY) {
+      magicContext.beginPath();
+      magicContext.arc(toX, toY, radius, 0, Math.PI * 2);
+      magicContext.fill();
+    } else {
+      magicContext.lineCap = "round";
+      magicContext.lineJoin = "round";
+      magicContext.lineWidth = radius * 2;
+      magicContext.beginPath();
+      magicContext.moveTo(fromX, fromY);
+      magicContext.lineTo(toX, toY);
+      magicContext.stroke();
+    }
+    magicContext.restore();
+
+    if (mode === "add") {
+      const selection = magicSelectionRef.current;
+      magicSelectionRef.current = selection
+        ? {
+            left:Math.min(selection.left, left),
+            top:Math.min(selection.top, top),
+            right:Math.max(selection.right, right),
+            bottom:Math.max(selection.bottom, bottom),
+          }
+        : { left, top, right, bottom };
+    }
+    return { left, top, right, bottom };
+  }, []);
+
+  const markMagicEditTiles = useCallback((
+    bounds: MagicSelection | undefined,
+    tiles: Set<number>,
+  ) => {
+    const canvas = magicCanvasRef.current;
+    if (!canvas || !bounds) return;
+    const columns = Math.ceil(canvas.width / MAGIC_EDIT_TILE_SIZE);
+    const firstX = Math.floor(bounds.left / MAGIC_EDIT_TILE_SIZE);
+    const lastX = Math.floor((bounds.right - 1) / MAGIC_EDIT_TILE_SIZE);
+    const firstY = Math.floor(bounds.top / MAGIC_EDIT_TILE_SIZE);
+    const lastY = Math.floor((bounds.bottom - 1) / MAGIC_EDIT_TILE_SIZE);
+    for (let tileY = firstY; tileY <= lastY; tileY += 1) {
+      for (let tileX = firstX; tileX <= lastX; tileX += 1) {
+        tiles.add(tileY * columns + tileX);
+      }
+    }
+  }, []);
+
+  const finishMagicEdit = useCallback((tiles: Set<number>) => {
+    const canvas = canvasRef.current;
+    const magicCanvas = magicCanvasRef.current;
+    const workContext = canvas?.getContext(
+      "2d",
+      { willReadFrequently:true },
+    );
+    const magicContext = magicCanvas?.getContext("2d");
+    if (!canvas || !magicCanvas || !workContext || !magicContext) return;
+    const columns = Math.ceil(magicCanvas.width / MAGIC_EDIT_TILE_SIZE);
+    for (const key of tiles) {
+      const tileX = key % columns;
+      const tileY = Math.floor(key / columns);
+      const left = tileX * MAGIC_EDIT_TILE_SIZE;
+      const top = tileY * MAGIC_EDIT_TILE_SIZE;
+      const width = Math.min(MAGIC_EDIT_TILE_SIZE, magicCanvas.width - left);
+      const height = Math.min(MAGIC_EDIT_TILE_SIZE, magicCanvas.height - top);
+      const maskPixels = magicContext.getImageData(
+        left,
+        top,
+        width,
+        height,
+      );
+      const visiblePixels = workContext.getImageData(
+        left,
+        top,
+        width,
+        height,
+      ).data;
+      for (
+        let offset = 3;
+        offset < maskPixels.data.length;
+        offset += 4
+      ) {
+        if (visiblePixels[offset] <= 4) maskPixels.data[offset] = 0;
+      }
+      magicContext.putImageData(maskPixels, left, top);
+    }
+  }, []);
+
   useEffect(() => {
     const viewport = viewportRef.current;
     if (!viewport) return;
-    const updateSize = () => setViewportSize({
-      width: viewport.clientWidth,
-      height: viewport.clientHeight,
-    });
+    const updateSize = () => {
+      viewportBoundsRef.current = viewport.getBoundingClientRect();
+      setViewportSize({
+        width: viewport.clientWidth,
+        height: viewport.clientHeight,
+      });
+    };
     updateSize();
     const observer = new ResizeObserver(updateSize);
     observer.observe(viewport);
     return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => () => {
+    if (brushFrameRef.current !== undefined) {
+      cancelAnimationFrame(brushFrameRef.current);
+    }
   }, []);
 
   useEffect(() => {
@@ -172,6 +846,14 @@ export function RefineEditor({
       }
       canvas.width = loadedProcessed.image.naturalWidth;
       canvas.height = loadedProcessed.image.naturalHeight;
+      const magicCanvas = magicCanvasRef.current;
+      if (magicCanvas) {
+        magicCanvas.width = canvas.width;
+        magicCanvas.height = canvas.height;
+        // Keep the interactive selection overlay GPU-backed. AI analysis reads
+        // it only at commit points; brush strokes update it continuously.
+        magicCanvas.getContext("2d");
+      }
       context.clearRect(0, 0, canvas.width, canvas.height);
       context.drawImage(loadedProcessed.image, 0, 0);
       sourceImageRef.current = loadedSource.image;
@@ -188,6 +870,7 @@ export function RefineEditor({
 
     return () => {
       cancelled = true;
+      magicAbortRef.current?.abort();
       processed?.release();
       source?.release();
     };
@@ -239,29 +922,45 @@ export function RefineEditor({
     if (right <= left || bottom <= top) return;
 
     captureUndoTiles(context, left, top, right, bottom);
-    const localX = x - left;
-    const localY = y - top;
-    const gradient = context.createRadialGradient(
-      x,
-      y,
-      radius * 0.42,
-      x,
-      y,
-      radius,
-    );
-    gradient.addColorStop(0, "rgba(0, 0, 0, 1)");
-    gradient.addColorStop(0.55, "rgba(0, 0, 0, 1)");
-    gradient.addColorStop(1, "rgba(0, 0, 0, 0)");
-
     if (tool === "erase") {
+      let brush = eraseBrushRef.current;
+      if (!brush || Math.abs(brush.radius - radius) > 0.01) {
+        const brushCanvas = document.createElement("canvas");
+        const diameter = Math.max(2, Math.ceil(radius * 2));
+        brushCanvas.width = diameter;
+        brushCanvas.height = diameter;
+        const brushContext = brushCanvas.getContext("2d");
+        if (!brushContext) return;
+        const center = diameter / 2;
+        const gradient = brushContext.createRadialGradient(
+          center,
+          center,
+          radius * 0.42,
+          center,
+          center,
+          radius,
+        );
+        gradient.addColorStop(0, "rgba(0, 0, 0, 1)");
+        gradient.addColorStop(0.55, "rgba(0, 0, 0, 1)");
+        gradient.addColorStop(1, "rgba(0, 0, 0, 0)");
+        brushContext.fillStyle = gradient;
+        brushContext.fillRect(0, 0, diameter, diameter);
+        brush = { radius, canvas: brushCanvas };
+        eraseBrushRef.current = brush;
+      }
       context.save();
       context.globalCompositeOperation = "destination-out";
-      context.fillStyle = gradient;
-      context.fillRect(left, top, right - left, bottom - top);
+      context.drawImage(
+        brush.canvas,
+        x - brush.canvas.width / 2,
+        y - brush.canvas.height / 2,
+      );
       context.restore();
       return;
     }
 
+    const localX = x - left;
+    const localY = y - top;
     const brushCanvas = document.createElement("canvas");
     brushCanvas.width = right - left;
     brushCanvas.height = bottom - top;
@@ -297,22 +996,1034 @@ export function RefineEditor({
     context.drawImage(brushCanvas, left, top);
   }, [captureUndoTiles, tool]);
 
-  const canvasPoint = useCallback((clientX: number, clientY: number) => {
+  const commitPaintedMagicSelection = useCallback((points: MagicPoint[]) => {
+    const canvas = canvasRef.current;
+    const magicCanvas = magicCanvasRef.current;
+    const workContext = canvas?.getContext(
+      "2d",
+      { willReadFrequently:true },
+    );
+    const magicContext = magicCanvas?.getContext(
+      "2d",
+      { willReadFrequently:true },
+    );
+    if (
+      !canvas
+      || !magicCanvas
+      || !workContext
+      || !magicContext
+      || !points.length
+    ) return;
+
+    let left = canvas.width;
+    let top = canvas.height;
+    let right = 0;
+    let bottom = 0;
+    magicContext.clearRect(
+      0,
+      0,
+      magicCanvas.width,
+      magicCanvas.height,
+    );
+    magicContext.save();
+    magicContext.fillStyle = "rgb(83, 218, 190)";
+    for (const point of points) {
+      left = Math.min(left, Math.floor(point.x - point.radius));
+      top = Math.min(top, Math.floor(point.y - point.radius));
+      right = Math.max(right, Math.ceil(point.x + point.radius));
+      bottom = Math.max(bottom, Math.ceil(point.y + point.radius));
+      magicContext.beginPath();
+      magicContext.arc(
+        point.x,
+        point.y,
+        point.radius,
+        0,
+        Math.PI * 2,
+      );
+      magicContext.fill();
+    }
+    magicContext.restore();
+
+    left = clamp(left, 0, canvas.width - 1);
+    top = clamp(top, 0, canvas.height - 1);
+    right = clamp(right, left + 1, canvas.width);
+    bottom = clamp(bottom, top + 1, canvas.height);
+    const width = right - left;
+    const height = bottom - top;
+    const maskPixels = magicContext.getImageData(
+      left,
+      top,
+      width,
+      height,
+    );
+    const visiblePixels = workContext.getImageData(
+      left,
+      top,
+      width,
+      height,
+    ).data;
+    let selectedPixelCount = 0;
+    for (
+      let offset = 3;
+      offset < maskPixels.data.length;
+      offset += 4
+    ) {
+      const selected = (
+        maskPixels.data[offset] >= MAGIC_MASK_ALPHA_THRESHOLD
+        && visiblePixels[offset] > 4
+      );
+      maskPixels.data[offset] = selected ? 255 : 0;
+      if (selected) selectedPixelCount += 1;
+    }
+    magicContext.putImageData(maskPixels, left, top);
+    if (!selectedPixelCount) {
+      clearMagicSelection();
+      setError("Paint over visible pixels to create a highlight.");
+      return;
+    }
+
+    magicSelectionRef.current = { left, top, right, bottom };
+    setHasMagicSelection(true);
+    setMagicEditMode("remove");
+    setMagicStatus("Highlight ready");
+    setError("");
+  }, [clearMagicSelection]);
+
+  const createAiMagicSelection = useCallback(async (
+    points: MagicPoint[],
+  ) => {
+    const canvas = canvasRef.current;
+    const magicCanvas = magicCanvasRef.current;
+    const workContext = canvas?.getContext(
+      "2d",
+      { willReadFrequently:true },
+    );
+    const magicContext = magicCanvas?.getContext(
+      "2d",
+      { willReadFrequently:true },
+    );
+    if (
+      !canvas
+      || !magicCanvas
+      || !workContext
+      || !magicContext
+      || !points.length
+    ) return;
+
+    let minimumX = canvas.width;
+    let minimumY = canvas.height;
+    let maximumX = 0;
+    let maximumY = 0;
+    let maximumRadius = 0;
+    for (const point of points) {
+      minimumX = Math.min(minimumX, point.x - point.radius);
+      minimumY = Math.min(minimumY, point.y - point.radius);
+      maximumX = Math.max(maximumX, point.x + point.radius);
+      maximumY = Math.max(maximumY, point.y + point.radius);
+      maximumRadius = Math.max(maximumRadius, point.radius);
+    }
+    const strokeWidth = Math.max(1, maximumX - minimumX);
+    const strokeHeight = Math.max(1, maximumY - minimumY);
+    const padding = Math.max(
+      48,
+      maximumRadius * 2.5,
+      Math.max(strokeWidth, strokeHeight) * 0.22,
+    );
+    let left = clamp(
+      Math.floor(minimumX - padding),
+      0,
+      canvas.width - 1,
+    );
+    let top = clamp(
+      Math.floor(minimumY - padding),
+      0,
+      canvas.height - 1,
+    );
+    let right = clamp(
+      Math.ceil(maximumX + padding),
+      left + 1,
+      canvas.width,
+    );
+    let bottom = clamp(
+      Math.ceil(maximumY + padding),
+      top + 1,
+      canvas.height,
+    );
+    const minimumCropEdge = Math.max(192, Math.ceil(maximumRadius * 6));
+    const expandAxis = (
+      start: number,
+      end: number,
+      limit: number,
+    ) => {
+      const needed = Math.min(limit, minimumCropEdge) - (end - start);
+      if (needed <= 0) return [start, end] as const;
+      const before = Math.min(start, Math.ceil(needed / 2));
+      const after = Math.min(limit - end, needed - before);
+      const remaining = needed - before - after;
+      return [
+        Math.max(0, start - before - remaining),
+        Math.min(limit, end + after),
+      ] as const;
+    };
+    [left, right] = expandAxis(left, right, canvas.width);
+    [top, bottom] = expandAxis(top, bottom, canvas.height);
+
+    const cropWidth = right - left;
+    const cropHeight = bottom - top;
+    const analysisScale = Math.min(
+      1,
+      1024 / Math.max(cropWidth, cropHeight),
+    );
+    const analysisWidth = Math.max(
+      2,
+      Math.round(cropWidth * analysisScale),
+    );
+    const analysisHeight = Math.max(
+      2,
+      Math.round(cropHeight * analysisScale),
+    );
+    const cropCanvas = document.createElement("canvas");
+    cropCanvas.width = analysisWidth;
+    cropCanvas.height = analysisHeight;
+    const cropContext = cropCanvas.getContext("2d");
+    if (!cropContext) {
+      setError("Unable to prepare the AI selection.");
+      return;
+    }
+    // The model sees the current cutout, not the discarded original
+    // background. Transparent finger gaps therefore remain real background.
+    cropContext.fillStyle = "#f4f4f5";
+    cropContext.fillRect(0, 0, analysisWidth, analysisHeight);
+    cropContext.drawImage(
+      canvas,
+      left,
+      top,
+      cropWidth,
+      cropHeight,
+      0,
+      0,
+      analysisWidth,
+      analysisHeight,
+    );
+
+    magicAbortRef.current?.abort();
+    const controller = new AbortController();
+    magicAbortRef.current = controller;
+    setAnalyzing(true);
+    setHasMagicSelection(false);
+    setError("");
+    setMagicStatus("Preparing AI selection");
+
+    try {
+      const ringLeft = minimumX - maximumRadius * 1.8;
+      const ringTop = minimumY - maximumRadius * 1.8;
+      const ringRight = maximumX + maximumRadius * 1.8;
+      const ringBottom = maximumY + maximumRadius * 1.8;
+      const ringMidX = (ringLeft + ringRight) / 2;
+      const ringMidY = (ringTop + ringBottom) / 2;
+      const negativeCandidates = [
+        [ringLeft, ringTop],
+        [ringMidX, ringTop],
+        [ringRight, ringTop],
+        [ringRight, ringMidY],
+        [ringRight, ringBottom],
+        [ringMidX, ringBottom],
+        [ringLeft, ringBottom],
+        [ringLeft, ringMidY],
+      ];
+      const negativeSeeds: Array<{
+        x:number;
+        y:number;
+        radius:number;
+        label:0;
+      }> = [];
+      for (const [candidateX, candidateY] of negativeCandidates) {
+        const x = Math.round(clamp(candidateX, 0, canvas.width - 1));
+        const y = Math.round(clamp(candidateY, 0, canvas.height - 1));
+        if (x < left || x >= right || y < top || y >= bottom) continue;
+        const isOutsideStroke = points.every(point => (
+          Math.hypot(x - point.x, y - point.y)
+            > point.radius * 1.45
+        ));
+        if (!isOutsideStroke) continue;
+        const alpha = workContext.getImageData(x, y, 1, 1).data[3];
+        if (alpha <= 16) continue;
+        negativeSeeds.push({
+          x:(x - left) * analysisScale,
+          y:(y - top) * analysisScale,
+          radius:Math.max(1, maximumRadius * analysisScale),
+          label:0,
+        });
+      }
+      const cropBitmap = await createImageBitmap(cropCanvas);
+      if (controller.signal.aborted) {
+        cropBitmap.close();
+        return;
+      }
+      const result = await createMagicSelectionMask(
+        cropBitmap,
+        [
+          ...points.map(point => ({
+            x:(point.x - left) * analysisScale,
+            y:(point.y - top) * analysisScale,
+            radius:Math.max(1, point.radius * analysisScale),
+            label:1 as const,
+          })),
+          ...negativeSeeds,
+        ],
+        controller.signal,
+        update => setMagicStatus(update.stage),
+      );
+      if (controller.signal.aborted) return;
+      if (
+        result.width !== analysisWidth
+        || result.height !== analysisHeight
+        || result.mask.length !== analysisWidth * analysisHeight
+      ) throw new Error("The AI returned an invalid selection mask.");
+
+      const visibleCanvas = document.createElement("canvas");
+      visibleCanvas.width = analysisWidth;
+      visibleCanvas.height = analysisHeight;
+      const visibleContext = visibleCanvas.getContext(
+        "2d",
+        { willReadFrequently:true },
+      );
+      if (!visibleContext) {
+        throw new Error("Unable to inspect the AI selection.");
+      }
+      visibleContext.drawImage(
+        canvas,
+        left,
+        top,
+        cropWidth,
+        cropHeight,
+        0,
+        0,
+        analysisWidth,
+        analysisHeight,
+      );
+      const visiblePixels = visibleContext.getImageData(
+        0,
+        0,
+        analysisWidth,
+        analysisHeight,
+      );
+      setMagicStatus("Refining AI highlight");
+      const refinedResult = await refineMagicSelectionMask(
+        result.mask,
+        visiblePixels.data,
+        analysisWidth,
+        analysisHeight,
+        points.map(point => ({
+          x: (point.x - left) * analysisScale,
+          y: (point.y - top) * analysisScale,
+          radius: Math.max(1, point.radius * analysisScale),
+        })),
+        controller.signal,
+      );
+      if (controller.signal.aborted) return;
+      if (
+        refinedResult.width !== analysisWidth
+        || refinedResult.height !== analysisHeight
+        || refinedResult.pixels.length !== analysisWidth * analysisHeight * 4
+      ) {
+        throw new Error("The AI returned an invalid refined highlight.");
+      }
+      if (!refinedResult.selectedPixelCount) {
+        throw new Error(
+          "The AI could not recognize an object under that stroke.",
+        );
+      }
+      const preview = document.createElement("canvas");
+      preview.width = analysisWidth;
+      preview.height = analysisHeight;
+      const previewContext = preview.getContext("2d");
+      if (!previewContext) {
+        throw new Error("Unable to preview the AI selection.");
+      }
+      const previewPixels = new ImageData(
+        refinedResult.pixels,
+        refinedResult.width,
+        refinedResult.height,
+      );
+      previewContext.putImageData(previewPixels, 0, 0);
+
+      magicContext.clearRect(
+        0,
+        0,
+        magicCanvas.width,
+        magicCanvas.height,
+      );
+      magicContext.imageSmoothingEnabled = true;
+      magicContext.imageSmoothingQuality = "high";
+      magicContext.drawImage(
+        preview,
+        0,
+        0,
+        analysisWidth,
+        analysisHeight,
+        left,
+        top,
+        cropWidth,
+        cropHeight,
+      );
+      magicSelectionRef.current = { left, top, right, bottom };
+      setHasMagicSelection(true);
+      setMagicEditMode("remove");
+      setMagicStatus("AI selection ready");
+    } catch (reason) {
+      if (
+        !(reason instanceof DOMException && reason.name === "AbortError")
+        && !controller.signal.aborted
+      ) {
+        clearMagicSelection();
+        setError(
+          reason instanceof Error
+            ? reason.message
+            : "Unable to create the AI selection.",
+        );
+      }
+    } finally {
+      if (magicAbortRef.current === controller) {
+        magicAbortRef.current = undefined;
+        setAnalyzing(false);
+      }
+    }
+  }, [clearMagicSelection]);
+
+  const analyzeMagicSelection = useCallback(async (points: MagicPoint[]) => {
+    const canvas = canvasRef.current;
+    const magicCanvas = magicCanvasRef.current;
+    const source = sourceImageRef.current;
+    const workContext = canvas?.getContext("2d", { willReadFrequently: true });
+    const magicContext = magicCanvas?.getContext("2d");
+    if (
+      !canvas
+      || !magicCanvas
+      || !source
+      || !workContext
+      || !magicContext
+      || !points.length
+    ) return;
+
+    let minimumX = canvas.width;
+    let minimumY = canvas.height;
+    let maximumX = 0;
+    let maximumY = 0;
+    let maximumRadius = 0;
+    for (const point of points) {
+      minimumX = Math.min(minimumX, point.x - point.radius);
+      minimumY = Math.min(minimumY, point.y - point.radius);
+      maximumX = Math.max(maximumX, point.x + point.radius);
+      maximumY = Math.max(maximumY, point.y + point.radius);
+      maximumRadius = Math.max(maximumRadius, point.radius);
+    }
+    const strokeWidth = Math.max(1, maximumX - minimumX);
+    const strokeHeight = Math.max(1, maximumY - minimumY);
+    const padding = Math.max(
+      48,
+      maximumRadius * 2.5,
+      Math.max(strokeWidth, strokeHeight) * 0.72,
+    );
+    let left = clamp(Math.floor(minimumX - padding), 0, canvas.width - 1);
+    let top = clamp(Math.floor(minimumY - padding), 0, canvas.height - 1);
+    let right = clamp(Math.ceil(maximumX + padding), left + 1, canvas.width);
+    let bottom = clamp(Math.ceil(maximumY + padding), top + 1, canvas.height);
+    const minimumCropEdge = Math.max(192, Math.ceil(maximumRadius * 6));
+    const expandAxis = (
+      start: number,
+      end: number,
+      limit: number,
+    ) => {
+      const needed = Math.min(limit, minimumCropEdge) - (end - start);
+      if (needed <= 0) return [start, end] as const;
+      const before = Math.min(start, Math.ceil(needed / 2));
+      const after = Math.min(limit - end, needed - before);
+      const remaining = needed - before - after;
+      return [
+        Math.max(0, start - before - remaining),
+        Math.min(limit, end + after),
+      ] as const;
+    };
+    [left, right] = expandAxis(left, right, canvas.width);
+    [top, bottom] = expandAxis(top, bottom, canvas.height);
+
+    const cropWidth = right - left;
+    const cropHeight = bottom - top;
+    const analysisScale = Math.min(
+      1,
+      1536 / Math.max(cropWidth, cropHeight),
+    );
+    const analysisWidth = Math.max(2, Math.round(cropWidth * analysisScale));
+    const analysisHeight = Math.max(2, Math.round(cropHeight * analysisScale));
+    const cropCanvas = document.createElement("canvas");
+    cropCanvas.width = analysisWidth;
+    cropCanvas.height = analysisHeight;
+    const cropContext = cropCanvas.getContext("2d");
+    if (!cropContext) {
+      setError("Unable to prepare the AI selection.");
+      return;
+    }
+    const sourceScaleX = source.naturalWidth / canvas.width;
+    const sourceScaleY = source.naturalHeight / canvas.height;
+    cropContext.drawImage(
+      source,
+      left * sourceScaleX,
+      top * sourceScaleY,
+      cropWidth * sourceScaleX,
+      cropHeight * sourceScaleY,
+      0,
+      0,
+      analysisWidth,
+      analysisHeight,
+    );
+    const sourcePixels = cropContext.getImageData(
+      0,
+      0,
+      analysisWidth,
+      analysisHeight,
+    ).data;
+    const finalizePaintedSelection = (clearExisting: boolean) => {
+      if (clearExisting) {
+        magicContext.clearRect(
+          0,
+          0,
+          magicCanvas.width,
+          magicCanvas.height,
+        );
+      }
+      magicContext.save();
+      magicContext.fillStyle = "rgb(83, 218, 190)";
+      for (const point of points) {
+        magicContext.beginPath();
+        magicContext.arc(
+          point.x,
+          point.y,
+          point.radius,
+          0,
+          Math.PI * 2,
+        );
+        magicContext.fill();
+      }
+      magicContext.restore();
+      const fullResolutionMask = magicContext.getImageData(
+        left,
+        top,
+        cropWidth,
+        cropHeight,
+      );
+      const fullResolutionVisible = workContext.getImageData(
+        left,
+        top,
+        cropWidth,
+        cropHeight,
+      ).data;
+      for (
+        let offset = 3;
+        offset < fullResolutionMask.data.length;
+        offset += 4
+      ) {
+        fullResolutionMask.data[offset] =
+          fullResolutionMask.data[offset] >= MAGIC_MASK_ALPHA_THRESHOLD
+            && fullResolutionVisible[offset] > 4
+            ? 255
+            : 0;
+      }
+      magicContext.putImageData(fullResolutionMask, left, top);
+      magicSelectionRef.current = { left, top, right, bottom };
+      setHasMagicSelection(true);
+      setMagicEditMode("remove");
+    };
+
+    magicAbortRef.current?.abort();
+    const controller = new AbortController();
+    magicAbortRef.current = controller;
+    setAnalyzing(true);
+    setHasMagicSelection(false);
+    setError("");
+    setMagicStatus("Snapping painted area to edges");
+    // Display a usable, alpha-clipped selection immediately. The model is an
+    // optional refinement pass and can no longer suppress the user's stroke.
+    finalizePaintedSelection(true);
+
+    try {
+      const analysisSeeds = points.map(point => ({
+        x: (point.x - left) * analysisScale,
+        y: (point.y - top) * analysisScale,
+        radius: Math.max(
+          1,
+          point.radius * analysisScale * MAGIC_HINT_CORE_RADIUS_SCALE,
+        ),
+      }));
+      const analysisPaintPoints = points.map(point => ({
+        x: (point.x - left) * analysisScale,
+        y: (point.y - top) * analysisScale,
+        radius: Math.max(1, point.radius * analysisScale),
+      }));
+      const cropBitmap = await createImageBitmap(cropCanvas);
+      if (controller.signal.aborted) {
+        cropBitmap.close();
+        return;
+      }
+      const result = await createMagicSelectionMask(
+        cropBitmap,
+        analysisSeeds,
+        controller.signal,
+        update => setMagicStatus(update.stage),
+      );
+      if (controller.signal.aborted) return;
+      if (
+        result.width !== analysisWidth
+        || result.height !== analysisHeight
+        || result.mask.length !== analysisWidth * analysisHeight
+      ) {
+        throw new Error("The AI returned an invalid selection mask.");
+      }
+      const resultPixels = result.mask;
+
+      const visibleCanvas = document.createElement("canvas");
+      visibleCanvas.width = analysisWidth;
+      visibleCanvas.height = analysisHeight;
+      const visibleContext = visibleCanvas.getContext(
+        "2d",
+        { willReadFrequently:true },
+      );
+      if (!visibleContext) throw new Error("Unable to inspect visible pixels.");
+      visibleContext.drawImage(
+        canvas,
+        left,
+        top,
+        cropWidth,
+        cropHeight,
+        0,
+        0,
+        analysisWidth,
+        analysisHeight,
+      );
+      const visiblePixels = visibleContext.getImageData(
+        0,
+        0,
+        analysisWidth,
+        analysisHeight,
+      ).data;
+
+      const sampleCanvas = document.createElement("canvas");
+      sampleCanvas.width = analysisWidth;
+      sampleCanvas.height = analysisHeight;
+      const sampleContext = sampleCanvas.getContext(
+        "2d",
+        { willReadFrequently:true },
+      );
+      if (!sampleContext) throw new Error("Unable to read the painted hint.");
+      sampleContext.fillStyle = "#fff";
+      // The painted brush is authoritative. AI may snap a short distance
+      // beyond it, but it must never remove visible pixels from the area the
+      // user explicitly covered.
+      for (const point of analysisPaintPoints) {
+        sampleContext.beginPath();
+        sampleContext.arc(
+          point.x,
+          point.y,
+          point.radius,
+          0,
+          Math.PI * 2,
+        );
+        sampleContext.fill();
+      }
+      const samplePixels = sampleContext.getImageData(
+        0,
+        0,
+        analysisWidth,
+        analysisHeight,
+      ).data;
+      const pixelCount = analysisWidth * analysisHeight;
+      const pointSamples = analysisPaintPoints.map((point, pointIndex) => {
+        const searchRadius = Math.max(
+          1,
+          analysisSeeds[pointIndex]?.radius ?? 1,
+        );
+        const sampleLeft = Math.max(
+          0,
+          Math.floor(point.x - searchRadius),
+        );
+        const sampleTop = Math.max(
+          0,
+          Math.floor(point.y - searchRadius),
+        );
+        const sampleRight = Math.min(
+          analysisWidth - 1,
+          Math.ceil(point.x + searchRadius),
+        );
+        const sampleBottom = Math.min(
+          analysisHeight - 1,
+          Math.ceil(point.y + searchRadius),
+        );
+        let closestDistance = Number.POSITIVE_INFINITY;
+        let sample: {
+          red: number;
+          green: number;
+          blue: number;
+          luminance: number;
+          chroma: number;
+          model: number;
+        } | undefined;
+        for (let y = sampleTop; y <= sampleBottom; y += 1) {
+          for (let x = sampleLeft; x <= sampleRight; x += 1) {
+            const horizontalDistance = x + 0.5 - point.x;
+            const verticalDistance = y + 0.5 - point.y;
+            const distance = (
+              horizontalDistance * horizontalDistance
+              + verticalDistance * verticalDistance
+            );
+            if (
+              distance > searchRadius * searchRadius
+              || distance >= closestDistance
+            ) continue;
+            const index = y * analysisWidth + x;
+            const offset = index * 4;
+            if (visiblePixels[offset + 3] <= 4) continue;
+            const red = sourcePixels[offset];
+            const green = sourcePixels[offset + 1];
+            const blue = sourcePixels[offset + 2];
+            closestDistance = distance;
+            sample = {
+              red,
+              green,
+              blue,
+              luminance:red * 0.2126 + green * 0.7152 + blue * 0.0722,
+              chroma:Math.max(red, green, blue) - Math.min(red, green, blue),
+              model:resultPixels[index],
+            };
+          }
+        }
+        return sample;
+      });
+      if (!pointSamples.some(Boolean)) {
+        throw new Error("Paint over a visible area to create an AI selection.");
+      }
+      const strokeDistance = new Float64Array(analysisPaintPoints.length);
+      for (
+        let pointIndex = 1;
+        pointIndex < analysisPaintPoints.length;
+        pointIndex += 1
+      ) {
+        const point = analysisPaintPoints[pointIndex];
+        const previous = analysisPaintPoints[pointIndex - 1];
+        strokeDistance[pointIndex] = (
+          strokeDistance[pointIndex - 1]
+          + Math.hypot(point.x - previous.x, point.y - previous.y)
+        );
+      }
+      const totalStrokeDistance = (
+        strokeDistance[strokeDistance.length - 1] ?? 0
+      );
+      const nearestPoint = new Int32Array(pixelCount);
+      nearestPoint.fill(-1);
+      const nearestDistance = new Float32Array(pixelCount);
+      nearestDistance.fill(Number.POSITIVE_INFINITY);
+      for (
+        let pointIndex = 0;
+        pointIndex < analysisPaintPoints.length;
+        pointIndex += 1
+      ) {
+        if (!pointSamples[pointIndex]) continue;
+        const point = analysisPaintPoints[pointIndex];
+        const endpointDistance = Math.min(
+          strokeDistance[pointIndex],
+          totalStrokeDistance - strokeDistance[pointIndex],
+        );
+        const endpointProgress = totalStrokeDistance > 0
+          ? clamp(
+              endpointDistance
+                / Math.max(
+                  1,
+                  point.radius * MAGIC_ENDPOINT_TAPER_DISTANCE_SCALE,
+                ),
+              0,
+              1,
+            )
+          : 0.25;
+        const growthScale = (
+          MAGIC_ENDPOINT_GROWTH_RADIUS_SCALE
+          + (
+            MAGIC_GROWTH_RADIUS_SCALE
+            - MAGIC_ENDPOINT_GROWTH_RADIUS_SCALE
+          ) * endpointProgress
+        );
+        const radius = Math.max(
+          1,
+          point.radius * growthScale,
+        );
+        const growthLeft = Math.max(0, Math.floor(point.x - radius));
+        const growthTop = Math.max(0, Math.floor(point.y - radius));
+        const growthRight = Math.min(
+          analysisWidth - 1,
+          Math.ceil(point.x + radius),
+        );
+        const growthBottom = Math.min(
+          analysisHeight - 1,
+          Math.ceil(point.y + radius),
+        );
+        for (let y = growthTop; y <= growthBottom; y += 1) {
+          const normalizedY = (y + 0.5 - point.y) / radius;
+          for (let x = growthLeft; x <= growthRight; x += 1) {
+            const normalizedX = (x + 0.5 - point.x) / radius;
+            const distance = (
+              normalizedX * normalizedX + normalizedY * normalizedY
+            );
+            if (distance > 1) continue;
+            const index = y * analysisWidth + x;
+            if (distance >= nearestDistance[index]) continue;
+            nearestDistance[index] = distance;
+            nearestPoint[index] = pointIndex;
+          }
+        }
+      }
+
+      const candidates = new Uint8Array(pixelCount);
+      const softCandidates = new Uint8Array(pixelCount);
+      const selected = new Uint8Array(pixelCount);
+      const queue = new Int32Array(pixelCount);
+      let write = 0;
+
+      for (let index = 0; index < pixelCount; index += 1) {
+        const offset = index * 4;
+        if (visiblePixels[offset + 3] <= 4) continue;
+        const isPaintedHint = samplePixels[offset + 3] > 24;
+        if (isPaintedHint) {
+          candidates[index] = 1;
+          softCandidates[index] = 1;
+          selected[index] = 1;
+          queue[write] = index;
+          write += 1;
+        }
+        const pointIndex = nearestPoint[index];
+        if (pointIndex < 0) continue;
+        const pointSample = pointSamples[pointIndex];
+        if (!pointSample) continue;
+        const red = sourcePixels[offset];
+        const green = sourcePixels[offset + 1];
+        const blue = sourcePixels[offset + 2];
+        const redDifference = red - pointSample.red;
+        const greenDifference = green - pointSample.green;
+        const blueDifference = blue - pointSample.blue;
+        const colorDistanceSquared = (
+          redDifference * redDifference
+          + greenDifference * greenDifference
+          + blueDifference * blueDifference
+        );
+        const luminance = red * 0.2126 + green * 0.7152 + blue * 0.0722;
+        const chroma = Math.max(red, green, blue) - Math.min(red, green, blue);
+        const luminanceDifference = Math.abs(
+          luminance - pointSample.luminance,
+        );
+        const chromaDifference = Math.abs(chroma - pointSample.chroma);
+        const modelDifference = Math.abs(
+          resultPixels[index] - pointSample.model,
+        );
+        if (
+          colorDistanceSquared
+            <= MAGIC_SOFT_COLOR_TOLERANCE
+              * MAGIC_SOFT_COLOR_TOLERANCE
+          && luminanceDifference <= MAGIC_SOFT_LUMINANCE_TOLERANCE
+          && chromaDifference <= MAGIC_SOFT_CHROMA_TOLERANCE
+          && modelDifference <= MAGIC_SOFT_MODEL_TOLERANCE
+        ) {
+          softCandidates[index] = 1;
+        }
+        if (
+          colorDistanceSquared
+            > MAGIC_POINT_COLOR_TOLERANCE * MAGIC_POINT_COLOR_TOLERANCE
+          || luminanceDifference > MAGIC_POINT_LUMINANCE_TOLERANCE
+          || chromaDifference > MAGIC_POINT_CHROMA_TOLERANCE
+          || modelDifference > MAGIC_POINT_MODEL_TOLERANCE
+        ) continue;
+        candidates[index] = 1;
+      }
+      if (!write) {
+        throw new Error(
+          "The AI could not find a removable region under that hint.",
+        );
+      }
+      const localColorToleranceSquared =
+        MAGIC_LOCAL_EDGE_COLOR_TOLERANCE
+        * MAGIC_LOCAL_EDGE_COLOR_TOLERANCE;
+      const addConnectedNeighbor = (
+        current: number,
+        neighbor: number,
+        allowed: Uint8Array,
+      ) => {
+        if (selected[neighbor] || !allowed[neighbor]) return;
+        const currentOffset = current * 4;
+        const neighborOffset = neighbor * 4;
+        const redDifference = (
+          sourcePixels[currentOffset] - sourcePixels[neighborOffset]
+        );
+        const greenDifference = (
+          sourcePixels[currentOffset + 1]
+          - sourcePixels[neighborOffset + 1]
+        );
+        const blueDifference = (
+          sourcePixels[currentOffset + 2]
+          - sourcePixels[neighborOffset + 2]
+        );
+        if (
+          redDifference * redDifference
+            + greenDifference * greenDifference
+            + blueDifference * blueDifference
+            > localColorToleranceSquared
+          || Math.abs(
+            visiblePixels[currentOffset + 3]
+              - visiblePixels[neighborOffset + 3],
+          ) > MAGIC_LOCAL_EDGE_ALPHA_TOLERANCE
+          || Math.abs(
+            resultPixels[current] - resultPixels[neighbor],
+          ) > MAGIC_LOCAL_EDGE_MODEL_TOLERANCE
+        ) return;
+        selected[neighbor] = 1;
+        queue[write] = neighbor;
+        write += 1;
+      };
+
+      for (let read = 0; read < write; read += 1) {
+        const index = queue[read];
+        const x = index % analysisWidth;
+        const y = Math.floor(index / analysisWidth);
+        if (x > 0) {
+          addConnectedNeighbor(index, index - 1, candidates);
+        }
+        if (x < analysisWidth - 1) {
+          addConnectedNeighbor(index, index + 1, candidates);
+        }
+        if (y > 0) {
+          addConnectedNeighbor(
+            index,
+            index - analysisWidth,
+            candidates,
+          );
+        }
+        if (y < analysisHeight - 1) {
+          addConnectedNeighbor(
+            index,
+            index + analysisWidth,
+            candidates,
+          );
+        }
+      }
+
+      const fillPixels = new Uint8Array(pixelCount);
+      for (let pass = 0; pass < MAGIC_HOLE_FILL_PASSES; pass += 1) {
+        let fillCount = 0;
+        for (let index = 0; index < pixelCount; index += 1) {
+          if (selected[index] || !softCandidates[index]) continue;
+          const x = index % analysisWidth;
+          const y = Math.floor(index / analysisWidth);
+          let selectedNeighbors = 0;
+          if (x > 0 && selected[index - 1]) selectedNeighbors += 1;
+          if (x < analysisWidth - 1 && selected[index + 1]) {
+            selectedNeighbors += 1;
+          }
+          if (y > 0 && selected[index - analysisWidth]) {
+            selectedNeighbors += 1;
+          }
+          if (y < analysisHeight - 1 && selected[index + analysisWidth]) {
+            selectedNeighbors += 1;
+          }
+          if (selectedNeighbors < 3) continue;
+          fillPixels[index] = 1;
+          fillCount += 1;
+        }
+        if (!fillCount) break;
+        for (let index = 0; index < pixelCount; index += 1) {
+          if (!fillPixels[index]) continue;
+          selected[index] = 1;
+          fillPixels[index] = 0;
+        }
+      }
+
+      const preview = document.createElement("canvas");
+      preview.width = analysisWidth;
+      preview.height = analysisHeight;
+      const previewContext = preview.getContext("2d");
+      if (!previewContext) throw new Error("Unable to preview the AI selection.");
+      const previewPixels = previewContext.createImageData(
+        analysisWidth,
+        analysisHeight,
+      );
+      for (let index = 0; index < pixelCount; index += 1) {
+        if (!selected[index]) continue;
+        const offset = index * 4;
+        previewPixels.data[offset] = 83;
+        previewPixels.data[offset + 1] = 218;
+        previewPixels.data[offset + 2] = 190;
+        previewPixels.data[offset + 3] = 255;
+      }
+      previewContext.putImageData(previewPixels, 0, 0);
+      magicContext.clearRect(0, 0, magicCanvas.width, magicCanvas.height);
+      magicContext.imageSmoothingEnabled = true;
+      magicContext.drawImage(
+        preview,
+        0,
+        0,
+        analysisWidth,
+        analysisHeight,
+        left,
+        top,
+        cropWidth,
+        cropHeight,
+      );
+      // Reapply the exact stroke after the AI preview so downscaling and
+      // inference can never create holes inside the painted foreground.
+      finalizePaintedSelection(false);
+      setMagicStatus("AI selection ready");
+    } catch (reason) {
+      if (
+        !(reason instanceof DOMException && reason.name === "AbortError")
+        && !controller.signal.aborted
+      ) {
+        finalizePaintedSelection(true);
+        setMagicStatus("Painted selection ready");
+      }
+    } finally {
+      if (magicAbortRef.current === controller) {
+        magicAbortRef.current = undefined;
+        setAnalyzing(false);
+      }
+    }
+  }, [clearMagicSelection]);
+
+  const createCanvasPointerMap = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const bounds = canvas.getBoundingClientRect();
-    if (
-      clientX < bounds.left
-      || clientX > bounds.right
-      || clientY < bounds.top
-      || clientY > bounds.bottom
-    ) return;
     return {
-      x: (clientX - bounds.left) * canvas.width / bounds.width,
-      y: (clientY - bounds.top) * canvas.height / bounds.height,
+      left: bounds.left,
+      top: bounds.top,
+      right: bounds.right,
+      bottom: bounds.bottom,
+      scaleX: canvas.width / bounds.width,
+      scaleY: canvas.height / bounds.height,
       radius: brushSize / 2 * canvas.width / bounds.width,
     };
   }, [brushSize]);
+
+  const canvasPoint = useCallback((
+    clientX: number,
+    clientY: number,
+    map: CanvasPointerMap,
+  ) => {
+    if (
+      clientX < map.left
+      || clientX > map.right
+      || clientY < map.top
+      || clientY > map.bottom
+    ) return;
+    return {
+      x: (clientX - map.left) * map.scaleX,
+      y: (clientY - map.top) * map.scaleY,
+      radius: map.radius,
+    };
+  }, []);
 
   const paintLine = useCallback((
     fromX: number,
@@ -322,7 +2033,7 @@ export function RefineEditor({
     radius: number,
   ) => {
     const distance = Math.hypot(toX - fromX, toY - fromY);
-    const spacing = Math.max(1, radius * 0.28);
+    const spacing = Math.max(1, radius * 0.42);
     const steps = Math.max(1, Math.ceil(distance / spacing));
     for (let step = 1; step <= steps; step += 1) {
       const progress = step / steps;
@@ -344,7 +2055,30 @@ export function RefineEditor({
     setHasChanges(undoRef.current.length > 0);
   }, []);
 
+  const applyMagicSelection = useCallback(() => {
+    const canvas = canvasRef.current;
+    const magicCanvas = magicCanvasRef.current;
+    const selection = magicSelectionRef.current;
+    const context = canvas?.getContext("2d", { willReadFrequently:true });
+    if (!canvas || !magicCanvas || !selection || !context) return;
+    activeStrokeRef.current = { tiles: [], seenTiles:new Set() };
+    captureUndoTiles(
+      context,
+      selection.left,
+      selection.top,
+      selection.right,
+      selection.bottom,
+    );
+    context.save();
+    context.globalCompositeOperation = "destination-out";
+    context.drawImage(magicCanvas, 0, 0);
+    context.restore();
+    finishStroke();
+    clearMagicSelection();
+  }, [captureUndoTiles, clearMagicSelection, finishStroke]);
+
   const undo = useCallback(() => {
+    clearMagicSelection();
     const canvas = canvasRef.current;
     const context = canvas?.getContext("2d", { willReadFrequently: true });
     const tiles = undoRef.current.pop();
@@ -353,10 +2087,12 @@ export function RefineEditor({
       context.putImageData(tile.pixels, tile.x, tile.y);
     }
     setUndoCount(undoRef.current.length);
-    setHasChanges(true);
-  }, []);
+    setHasChanges(undoRef.current.length > 0);
+  }, [clearMagicSelection]);
 
   const reset = useCallback(() => {
+    magicAbortRef.current?.abort();
+    clearMagicSelection();
     const canvas = canvasRef.current;
     const baseline = baselineImageRef.current;
     const context = canvas?.getContext("2d", { willReadFrequently: true });
@@ -366,7 +2102,19 @@ export function RefineEditor({
     undoRef.current = [];
     setUndoCount(0);
     setHasChanges(false);
-  }, []);
+  }, [clearMagicSelection]);
+
+  const selectTool = useCallback((nextTool: RefineTool) => {
+    if (isAnalyzing) return;
+    clearMagicSelection();
+    setError("");
+    setTool(nextTool);
+  }, [clearMagicSelection, isAnalyzing]);
+
+  const closeEditor = useCallback(() => {
+    magicAbortRef.current?.abort();
+    onClose();
+  }, [onClose]);
 
   const save = async () => {
     const canvas = canvasRef.current;
@@ -392,11 +2140,30 @@ export function RefineEditor({
       } else if (event.key === "]") {
         setBrushSize(current => clamp(current + 8, 12, 180));
       } else if (event.key.toLowerCase() === "r") {
-        setTool("restore");
+        selectTool("restore");
       } else if (event.key.toLowerCase() === "e") {
-        setTool("erase");
+        selectTool("erase");
+      } else if (event.key.toLowerCase() === "w") {
+        selectTool("magic");
+      } else if (
+        hasMagicSelection
+        && event.key.toLowerCase() === "a"
+      ) {
+        setMagicEditMode("add");
+      } else if (
+        hasMagicSelection
+        && event.key.toLowerCase() === "s"
+      ) {
+        setMagicEditMode("remove");
       } else if (event.key === "Escape" && !isSaving) {
-        onClose();
+        if (isAnalyzing) {
+          magicAbortRef.current?.abort();
+          clearMagicSelection();
+        } else if (hasMagicSelection) {
+          clearMagicSelection();
+        } else {
+          closeEditor();
+        }
       }
     };
     document.addEventListener("keydown", onKeyDown);
@@ -406,15 +2173,38 @@ export function RefineEditor({
       document.removeEventListener("keydown", onKeyDown);
       document.body.style.overflow = previousOverflow;
     };
-  }, [isSaving, onClose, undo]);
+  }, [
+    clearMagicSelection,
+    closeEditor,
+    hasMagicSelection,
+    isAnalyzing,
+    isSaving,
+    selectTool,
+    undo,
+  ]);
 
   const setZoomLevel = (nextZoom: number) => {
     setZoom(clamp(nextZoom, MIN_ZOOM, MAX_ZOOM));
     if (nextZoom <= MIN_ZOOM) setPan({ x: 0, y: 0 });
   };
 
+  const moveBrushCursor = useCallback((clientX: number, clientY: number) => {
+    const cursor = brushCursorRef.current;
+    const viewport = viewportRef.current;
+    if (!cursor || !viewport) return;
+    let bounds = viewportBoundsRef.current;
+    if (!bounds) {
+      bounds = viewport.getBoundingClientRect();
+      viewportBoundsRef.current = bounds;
+    }
+    cursor.style.transform = `translate3d(${
+      clientX - bounds.left
+    }px, ${clientY - bounds.top}px, 0) translate(-50%, -50%)`;
+    cursor.style.opacity = "1";
+  }, []);
+
   const onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (isLoading || event.button > 1) return;
+    if (isLoading || isAnalyzing || event.button > 1) return;
     event.currentTarget.setPointerCapture(event.pointerId);
     if (tool === "move" || event.button === 1 || event.altKey) {
       pointerActionRef.current = {
@@ -427,27 +2217,132 @@ export function RefineEditor({
       };
       return;
     }
-    const point = canvasPoint(event.clientX, event.clientY);
+    const map = createCanvasPointerMap();
+    if (!map) return;
+    const point = canvasPoint(event.clientX, event.clientY, map);
     if (!point) return;
+    if (tool === "magic") {
+      if (hasMagicSelection) {
+        const dirtyTiles = new Set<number>();
+        const editBounds = editMagicSelectionLine(
+          point.x,
+          point.y,
+          point.x,
+          point.y,
+          point.radius,
+          magicEditMode,
+        );
+        if (magicEditMode === "add") {
+          markMagicEditTiles(editBounds, dirtyTiles);
+        }
+        pointerActionRef.current = {
+          type:"magic-edit",
+          pointerId:event.pointerId,
+          lastX:point.x,
+          lastY:point.y,
+          mode:magicEditMode,
+          map,
+          dirtyTiles,
+        };
+        return;
+      }
+      clearMagicSelection();
+      const magicPoint = {
+        x:point.x,
+        y:point.y,
+        radius:point.radius,
+      };
+      drawMagicHint(
+        magicPoint.x,
+        magicPoint.y,
+        magicPoint.x,
+        magicPoint.y,
+        magicPoint.radius,
+      );
+      pointerActionRef.current = {
+        type:"magic",
+        pointerId:event.pointerId,
+        lastX:point.x,
+        lastY:point.y,
+        points:[magicPoint],
+        map,
+      };
+      return;
+    }
     activeStrokeRef.current = { tiles: [], seenTiles: new Set() };
     pointerActionRef.current = {
       type: "paint",
       pointerId: event.pointerId,
       lastX: point.x,
       lastY: point.y,
+      map,
     };
     stamp(point.x, point.y, point.radius);
   };
 
-  const onPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
-    const viewport = viewportRef.current?.getBoundingClientRect();
-    if (viewport) {
-      setCursor({
-        x: event.clientX - viewport.left,
-        y: event.clientY - viewport.top,
-        visible: true,
-      });
+  const processBrushMove = (
+    pointerId: number,
+    clientX: number,
+    clientY: number,
+  ) => {
+    const action = pointerActionRef.current;
+    if (
+      !action
+      || action.pointerId !== pointerId
+      || action.type === "pan"
+    ) return;
+    const point = canvasPoint(clientX, clientY, action.map);
+    if (!point) return;
+    if (action.type === "magic-edit") {
+      const editBounds = editMagicSelectionLine(
+        action.lastX,
+        action.lastY,
+        point.x,
+        point.y,
+        point.radius,
+        action.mode,
+      );
+      if (action.mode === "add") {
+        markMagicEditTiles(editBounds, action.dirtyTiles);
+      }
+      action.lastX = point.x;
+      action.lastY = point.y;
+      return;
     }
+    if (action.type === "magic") {
+      const distance = Math.hypot(
+        point.x - action.lastX,
+        point.y - action.lastY,
+      );
+      const spacing = Math.max(1, point.radius * 0.42);
+      const steps = Math.max(1, Math.ceil(distance / spacing));
+      for (let step = 1; step <= steps; step += 1) {
+        const progress = step / steps;
+        const magicPoint = {
+          x:action.lastX + (point.x - action.lastX) * progress,
+          y:action.lastY + (point.y - action.lastY) * progress,
+          radius:point.radius,
+        };
+        action.points.push(magicPoint);
+      }
+      drawMagicHint(
+        action.lastX,
+        action.lastY,
+        point.x,
+        point.y,
+        point.radius,
+      );
+      action.lastX = point.x;
+      action.lastY = point.y;
+      return;
+    }
+    paintLine(action.lastX, action.lastY, point.x, point.y, point.radius);
+    action.lastX = point.x;
+    action.lastY = point.y;
+  };
+
+  const onPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    moveBrushCursor(event.clientX, event.clientY);
     const action = pointerActionRef.current;
     if (!action || action.pointerId !== event.pointerId) return;
     if (action.type === "pan") {
@@ -457,18 +2352,72 @@ export function RefineEditor({
       });
       return;
     }
-    const point = canvasPoint(event.clientX, event.clientY);
-    if (!point) return;
-    paintLine(action.lastX, action.lastY, point.x, point.y, point.radius);
-    action.lastX = point.x;
-    action.lastY = point.y;
+    pendingBrushMoveRef.current = {
+      pointerId: event.pointerId,
+      clientX: event.clientX,
+      clientY: event.clientY,
+    };
+    if (brushFrameRef.current !== undefined) return;
+    brushFrameRef.current = requestAnimationFrame(() => {
+      brushFrameRef.current = undefined;
+      const pending = pendingBrushMoveRef.current;
+      pendingBrushMoveRef.current = undefined;
+      if (pending) {
+        processBrushMove(
+          pending.pointerId,
+          pending.clientX,
+          pending.clientY,
+        );
+      }
+    });
   };
 
   const onPointerEnd = (event: React.PointerEvent<HTMLDivElement>) => {
-    const action = pointerActionRef.current;
+    let action = pointerActionRef.current;
     if (!action || action.pointerId !== event.pointerId) return;
+    if (brushFrameRef.current !== undefined) {
+      cancelAnimationFrame(brushFrameRef.current);
+      brushFrameRef.current = undefined;
+    }
+    const pending = pendingBrushMoveRef.current;
+    pendingBrushMoveRef.current = undefined;
+    if (pending?.pointerId === event.pointerId) {
+      processBrushMove(
+        pending.pointerId,
+        pending.clientX,
+        pending.clientY,
+      );
+    }
+    action = pointerActionRef.current;
+    if (!action || action.pointerId !== event.pointerId) return;
+    if (action.type !== "pan") {
+      const endPoint = canvasPoint(
+        event.clientX,
+        event.clientY,
+        action.map,
+      );
+      if (
+        endPoint
+        && Math.hypot(
+          endPoint.x - action.lastX,
+          endPoint.y - action.lastY,
+        ) > 0.01
+      ) {
+        processBrushMove(event.pointerId, event.clientX, event.clientY);
+      }
+    }
     if (action.type === "paint") finishStroke();
+    if (action.type === "magic-edit" && action.mode === "add") {
+      finishMagicEdit(action.dirtyTiles);
+    }
     pointerActionRef.current = undefined;
+    if (action.type === "magic") {
+      if (event.type === "pointerup") {
+        void createAiMagicSelection(action.points);
+      } else {
+        clearMagicSelection();
+      }
+    }
   };
 
   return (
@@ -487,7 +2436,7 @@ export function RefineEditor({
           <button
             type="button"
             className="refine-close"
-            onClick={onClose}
+            onClick={closeEditor}
             disabled={isSaving}
             aria-label="Close refine editor"
           >
@@ -500,8 +2449,9 @@ export function RefineEditor({
             <button
               type="button"
               className={tool === "restore" ? "selected restore" : ""}
-              onClick={() => setTool("restore")}
+              onClick={() => selectTool("restore")}
               aria-pressed={tool === "restore"}
+              disabled={isAnalyzing}
               title="Restore pixels (R)"
             >
               <Brush size={17} />
@@ -510,8 +2460,9 @@ export function RefineEditor({
             <button
               type="button"
               className={tool === "erase" ? "selected erase" : ""}
-              onClick={() => setTool("erase")}
+              onClick={() => selectTool("erase")}
               aria-pressed={tool === "erase"}
+              disabled={isAnalyzing}
               title="Erase pixels (E)"
             >
               <Eraser size={17} />
@@ -519,9 +2470,21 @@ export function RefineEditor({
             </button>
             <button
               type="button"
+              className={tool === "magic" ? "selected magic" : ""}
+              onClick={() => selectTool("magic")}
+              aria-pressed={tool === "magic"}
+              disabled={isAnalyzing}
+              title="Paint a hint for AI selection (W)"
+            >
+              <WandSparkles size={17} />
+              <span>AI Select</span>
+            </button>
+            <button
+              type="button"
               className={tool === "move" ? "selected" : ""}
-              onClick={() => setTool("move")}
+              onClick={() => selectTool("move")}
               aria-pressed={tool === "move"}
+              disabled={isAnalyzing}
               title="Move canvas"
             >
               <Hand size={17} />
@@ -538,16 +2501,81 @@ export function RefineEditor({
               step="2"
               value={brushSize}
               onChange={event => setBrushSize(Number(event.target.value))}
-              disabled={tool === "move"}
+              disabled={tool === "move" || isAnalyzing}
             />
             <output>{brushSize}px</output>
           </label>
+
+          {(isAnalyzing || hasMagicSelection) && (
+            <div
+              className="magic-selection-actions"
+              role={isAnalyzing ? "status" : "group"}
+              aria-label={
+                isAnalyzing ? undefined : "Edit AI highlight"
+              }
+            >
+              {isAnalyzing ? (
+                <>
+                  <LoaderCircle className="spin" size={16} />
+                  <span>{magicStatus || "Finding region"}</span>
+                </>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    className={
+                      magicEditMode === "add"
+                        ? "magic-mask-mode selected"
+                        : "magic-mask-mode"
+                    }
+                    onClick={() => setMagicEditMode("add")}
+                    aria-pressed={magicEditMode === "add"}
+                    title="Paint missing highlight (A)"
+                  >
+                    <Brush size={14} />
+                    Add
+                  </button>
+                  <button
+                    type="button"
+                    className={
+                      magicEditMode === "remove"
+                        ? "magic-mask-mode selected remove"
+                        : "magic-mask-mode remove"
+                    }
+                    onClick={() => setMagicEditMode("remove")}
+                    aria-pressed={magicEditMode === "remove"}
+                    title="Paint away excess highlight (S)"
+                  >
+                    <Eraser size={14} />
+                    Remove
+                  </button>
+                  <button
+                    type="button"
+                    className="apply-magic-selection"
+                    onClick={applyMagicSelection}
+                  >
+                    <Eraser size={15} />
+                    Erase highlight
+                  </button>
+                  <button
+                    type="button"
+                    className="clear-magic-selection"
+                    onClick={clearMagicSelection}
+                    aria-label="Clear AI selection"
+                    title="Clear selection"
+                  >
+                    <X size={15} />
+                  </button>
+                </>
+              )}
+            </div>
+          )}
 
           <div className="refine-history">
             <button
               type="button"
               onClick={undo}
-              disabled={!undoCount}
+              disabled={!undoCount || isAnalyzing}
               title="Undo last stroke (Ctrl+Z)"
             >
               <Undo2 size={17} />
@@ -556,7 +2584,7 @@ export function RefineEditor({
             <button
               type="button"
               onClick={reset}
-              disabled={!hasChanges}
+              disabled={!hasChanges || isAnalyzing}
               title="Reset all refinements"
             >
               <RotateCcw size={17} />
@@ -572,8 +2600,16 @@ export function RefineEditor({
           onPointerMove={onPointerMove}
           onPointerUp={onPointerEnd}
           onPointerCancel={onPointerEnd}
-          onPointerLeave={() => setCursor(current => ({ ...current, visible: false }))}
-          onPointerEnter={() => setCursor(current => ({ ...current, visible: true }))}
+          onPointerLeave={() => {
+            if (brushCursorRef.current) {
+              brushCursorRef.current.style.opacity = "0";
+            }
+          }}
+          onPointerEnter={event => {
+            viewportBoundsRef.current =
+              event.currentTarget.getBoundingClientRect();
+            moveBrushCursor(event.clientX, event.clientY);
+          }}
           onWheel={event => {
             event.preventDefault();
             setZoomLevel(zoom * (event.deltaY > 0 ? 0.88 : 1.14));
@@ -589,21 +2625,33 @@ export function RefineEditor({
               transform: `translate(calc(-50% + ${pan.x}px), calc(-50% + ${pan.y}px))`,
             }}
           />
+          <canvas
+            ref={magicCanvasRef}
+            className="refine-canvas magic-selection-canvas"
+            aria-label="AI removal selection preview"
+            style={{
+              width: `${displayWidth}px`,
+              height: `${displayHeight}px`,
+              transform: `translate(calc(-50% + ${pan.x}px), calc(-50% + ${pan.y}px))`,
+            }}
+          />
           {isLoading && (
             <div className="refine-loading" role="status">
               <LoaderCircle size={22} />
               <span>Opening full-resolution image…</span>
             </div>
           )}
-          {!isLoading && tool !== "move" && cursor.visible && (
+          {!isLoading && tool !== "move" && (
             <span
+              ref={brushCursorRef}
               className={`brush-cursor ${tool}`}
               aria-hidden="true"
               style={{
                 width: `${brushSize}px`,
                 height: `${brushSize}px`,
-                left: `${cursor.x}px`,
-                top: `${cursor.y}px`,
+                left: 0,
+                top: 0,
+                opacity: 0,
               }}
             />
           )}
@@ -650,16 +2698,30 @@ export function RefineEditor({
           </div>
           <p className={error ? "refine-error" : "refine-help"} role={error ? "alert" : undefined}>
             {error || (
-              tool === "move"
-                ? "Drag to move. Scroll to zoom."
-                : "Paint over the image. Use [ and ] to resize the brush."
+              isAnalyzing
+                ? magicStatus || "Finding the exact region"
+                : hasMagicSelection
+                  ? "Paint with Add or Remove to correct the highlight, then erase it."
+                  : tool === "move"
+                    ? "Drag to move. Scroll to zoom."
+                    : tool === "magic"
+                      ? "Paint loosely over a part. AI will recognize and highlight it."
+                      : "Paint over the image. Use [ and ] to resize the brush."
             )}
           </p>
           <div className="refine-actions">
-            <Button variant="secondary" onClick={onClose} disabled={isSaving}>
+            <Button variant="secondary" onClick={closeEditor} disabled={isSaving}>
               Cancel
             </Button>
-            <Button onClick={save} disabled={!isReady || isSaving}>
+            <Button
+              onClick={save}
+              disabled={
+                !isReady
+                || isSaving
+                || isAnalyzing
+                || hasMagicSelection
+              }
+            >
               {isSaving
                 ? <LoaderCircle className="spin" size={17} />
                 : <Check size={17} />}

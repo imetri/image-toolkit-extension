@@ -6,13 +6,34 @@ type BackgroundResult = {
   height: number
 }
 
+export type MagicMaskSeed = {
+  x: number
+  y: number
+  radius: number
+}
+
+type MagicMaskResult = {
+  mask: Uint8ClampedArray
+  width: number
+  height: number
+}
+
+type WorkerResult = BackgroundResult | MagicMaskResult
+
 type WorkerMessage =
   | ({ type:'progress'; id:string } & ProcessProgress)
   | ({ type:'result'; id:string } & BackgroundResult)
+  | {
+      type:'mask-result'
+      id:string
+      mask:ArrayBuffer
+      width:number
+      height:number
+    }
   | { type:'error'; id:string; error:string }
 
 type PendingRequest = {
-  resolve: (result: BackgroundResult) => void
+  resolve: (result: WorkerResult) => void
   reject: (error: Error) => void
   onProgress?: (update: ProcessProgress) => void
   refreshTimeout: () => void
@@ -56,6 +77,12 @@ function getWorker() {
     request.cleanup()
     if (data.type === 'error') {
       request.reject(new Error(data.error))
+    } else if (data.type === 'mask-result') {
+      request.resolve({
+        mask:new Uint8ClampedArray(data.mask),
+        width:data.width,
+        height:data.height,
+      })
     } else {
       request.resolve({
         blob:data.blob,
@@ -70,22 +97,25 @@ function getWorker() {
   return worker
 }
 
-export function removeImageBackground(
-  image: Blob,
+function runBackgroundWorker<TResult extends WorkerResult>(
+  createRequest: (id:string) => {
+    message:object
+    transfer?:Transferable[]
+  },
   signal?: AbortSignal,
   onProgress?: (update: ProcessProgress) => void,
 ) {
   if (signal?.aborted) return Promise.reject(abortError())
   const id = crypto.randomUUID()
 
-  return new Promise<BackgroundResult>((resolve, reject) => {
+  return new Promise<TResult>((resolve, reject) => {
     let timeout: number | undefined
     const refreshTimeout = () => {
       if (timeout !== undefined) window.clearTimeout(timeout)
       timeout = window.setTimeout(() => {
         if (!pending.has(id)) return
         stopWorker(new Error(
-          'Background removal stopped responding before it could complete.',
+          'Image analysis stopped responding before it could complete.',
         ))
       }, BACKGROUND_REMOVAL_IDLE_TIMEOUT)
     }
@@ -99,7 +129,7 @@ export function removeImageBackground(
     }
 
     pending.set(id, {
-      resolve,
+      resolve:result => resolve(result as TResult),
       reject,
       onProgress,
       refreshTimeout,
@@ -107,8 +137,39 @@ export function removeImageBackground(
     })
     signal?.addEventListener('abort', cancel, { once:true })
     refreshTimeout()
-    getWorker().postMessage({ type:'remove-background', id, image })
+    const request = createRequest(id)
+    getWorker().postMessage(request.message, request.transfer ?? [])
   })
+}
+
+export function removeImageBackground(
+  image: Blob,
+  signal?: AbortSignal,
+  onProgress?: (update: ProcessProgress) => void,
+) {
+  return runBackgroundWorker<BackgroundResult>(
+    id => ({
+      message:{ type:'remove-background', id, image },
+    }),
+    signal,
+    onProgress,
+  )
+}
+
+export function createMagicSelectionMask(
+  image: ImageBitmap,
+  seeds: MagicMaskSeed[],
+  signal?: AbortSignal,
+  onProgress?: (update: ProcessProgress) => void,
+) {
+  return runBackgroundWorker<MagicMaskResult>(
+    id => ({
+      message:{ type:'select-region', id, image, seeds },
+      transfer:[image],
+    }),
+    signal,
+    onProgress,
+  )
 }
 
 export function resetBackgroundRemoval() {

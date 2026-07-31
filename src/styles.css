@@ -854,6 +854,16 @@ main {
   background: #fff3f4;
 }
 
+.refine-tool-group button.selected.magic {
+  border-color: #aee4d9;
+  color: #147d6b;
+  background: #edfbf7;
+}
+
+.refine-tool-group button:disabled {
+  opacity: 0.52;
+}
+
 .refine-size {
   min-width: 230px;
   display: grid;
@@ -885,6 +895,79 @@ main {
   opacity: 0.4;
 }
 
+.magic-selection-actions {
+  min-height: 38px;
+  padding: 3px 4px 3px 10px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid #bfe8df;
+  border-radius: 9px;
+  color: #147d6b;
+  background: #edfbf7;
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.magic-selection-actions > span {
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.magic-selection-actions button {
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 0;
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.magic-mask-mode {
+  padding: 0 8px;
+  color: #147d6b;
+  background: transparent;
+}
+
+.magic-mask-mode:hover {
+  background: rgba(20, 125, 107, 0.1);
+}
+
+.magic-mask-mode.selected {
+  color: #fff;
+  background: #2b9d89;
+}
+
+.magic-mask-mode.selected.remove {
+  background: #b54a58;
+}
+
+.apply-magic-selection {
+  padding: 0 10px;
+  color: #fff;
+  background: #168c78;
+}
+
+.apply-magic-selection:hover {
+  background: #0d725f;
+}
+
+.clear-magic-selection {
+  width: 30px;
+  padding: 0;
+  color: #147d6b;
+  background: transparent;
+}
+
+.clear-magic-selection:hover {
+  background: rgba(20, 125, 107, 0.1);
+}
+
 .refine-viewport {
   min-height: 0;
   position: relative;
@@ -901,7 +984,8 @@ main {
 }
 
 .refine-viewport.tool-restore,
-.refine-viewport.tool-erase {
+.refine-viewport.tool-erase,
+.refine-viewport.tool-magic {
   cursor: none;
 }
 
@@ -922,6 +1006,13 @@ main {
   box-shadow: 0 8px 30px rgba(28, 24, 39, 0.2);
 }
 
+.magic-selection-canvas {
+  z-index: 2;
+  opacity: 0.56;
+  pointer-events: none;
+  box-shadow: none;
+}
+
 .brush-cursor {
   position: absolute;
   z-index: 4;
@@ -932,10 +1023,12 @@ main {
     inset 0 0 0 1px rgba(20, 18, 27, 0.25);
   pointer-events: none;
   transform: translate(-50%, -50%);
+  will-change: transform;
 }
 
 .brush-cursor.restore::after,
-.brush-cursor.erase::after {
+.brush-cursor.erase::after,
+.brush-cursor.magic::after {
   content: "";
   width: 4px;
   height: 4px;
@@ -949,6 +1042,10 @@ main {
 
 .brush-cursor.erase::after {
   background: #c54b59;
+}
+
+.brush-cursor.magic::after {
+  background: #16a88f;
 }
 
 .refine-loading {
