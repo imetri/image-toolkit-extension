@@ -19,6 +19,7 @@ import {
   useState,
 } from "react";
 import { createMagicSelectionMask } from "../lib/magicSelection";
+import { refineMagicSelectionMask } from "../lib/magicSelectionRefinement";
 import type { ProcessedItem } from "../types";
 import { Button } from "./ui";
 
@@ -49,12 +50,29 @@ type ActiveStroke = {
   seenTiles: Set<number>;
 };
 
+type CanvasPointerMap = {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+  scaleX: number;
+  scaleY: number;
+  radius: number;
+};
+
+type PendingBrushMove = {
+  pointerId: number;
+  clientX: number;
+  clientY: number;
+};
+
 type PointerAction =
   | {
       type: "paint";
       pointerId: number;
       lastX: number;
       lastY: number;
+      map: CanvasPointerMap;
     }
   | {
       type: "pan";
@@ -70,6 +88,7 @@ type PointerAction =
       lastX: number;
       lastY: number;
       points: MagicPoint[];
+      map: CanvasPointerMap;
     }
   | {
       type: "magic-edit";
@@ -77,6 +96,8 @@ type PointerAction =
       lastX: number;
       lastY: number;
       mode: MagicEditMode;
+      map: CanvasPointerMap;
+      dirtyTiles: Set<number>;
     };
 
 type LoadedImage = {
@@ -88,6 +109,7 @@ const MIN_ZOOM = 1;
 const MAX_ZOOM = 8;
 const UNDO_LIMIT = 12;
 const UNDO_TILE_SIZE = 128;
+const MAGIC_EDIT_TILE_SIZE = 256;
 const MAGIC_MASK_ALPHA_THRESHOLD = 128;
 const MAGIC_HINT_CORE_RADIUS_SCALE = 0.26;
 const MAGIC_GROWTH_RADIUS_SCALE = 1.08;
@@ -567,6 +589,10 @@ export function RefineEditor({
   const viewportRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const magicCanvasRef = useRef<HTMLCanvasElement>(null);
+  const brushCursorRef = useRef<HTMLSpanElement>(null);
+  const viewportBoundsRef = useRef<DOMRect>();
+  const pendingBrushMoveRef = useRef<PendingBrushMove>();
+  const brushFrameRef = useRef<number>();
   const sourceImageRef = useRef<HTMLImageElement>();
   const baselineImageRef = useRef<HTMLImageElement>();
   const pointerActionRef = useRef<PointerAction>();
@@ -574,6 +600,10 @@ export function RefineEditor({
   const magicSelectionRef = useRef<MagicSelection>();
   const magicAbortRef = useRef<AbortController>();
   const undoRef = useRef<UndoTile[][]>([]);
+  const eraseBrushRef = useRef<{
+    radius: number;
+    canvas: HTMLCanvasElement;
+  }>();
   const [tool, setTool] = useState<RefineTool>("restore");
   const [brushSize, setBrushSize] = useState(64);
   const [zoom, setZoom] = useState(1);
@@ -583,7 +613,6 @@ export function RefineEditor({
     width: item.width ?? 1,
     height: item.height ?? 1,
   });
-  const [cursor, setCursor] = useState({ x: 0, y: 0, visible: false });
   const [isLoading, setLoading] = useState(true);
   const [isReady, setReady] = useState(false);
   const [isSaving, setSaving] = useState(false);
@@ -626,81 +655,32 @@ export function RefineEditor({
     setMagicStatus("");
   }, []);
 
-  const drawMagicHint = useCallback((point: MagicPoint) => {
+  const drawMagicHint = useCallback((
+    fromX: number,
+    fromY: number,
+    toX: number,
+    toY: number,
+    radius: number,
+  ) => {
     const context = magicCanvasRef.current?.getContext("2d");
     if (!context) return;
     context.save();
     context.fillStyle = "rgba(83, 218, 190, 0.92)";
-    context.beginPath();
-    context.arc(point.x, point.y, point.radius, 0, Math.PI * 2);
-    context.fill();
-    context.restore();
-  }, []);
-
-  const editMagicSelectionStamp = useCallback((
-    x: number,
-    y: number,
-    radius: number,
-    mode: MagicEditMode,
-  ) => {
-    const magicCanvas = magicCanvasRef.current;
-    const canvas = canvasRef.current;
-    const magicContext = magicCanvas?.getContext(
-      "2d",
-      { willReadFrequently:true },
-    );
-    const workContext = canvas?.getContext(
-      "2d",
-      { willReadFrequently:true },
-    );
-    if (!magicCanvas || !canvas || !magicContext || !workContext) return;
-    const left = Math.max(0, Math.floor(x - radius));
-    const top = Math.max(0, Math.floor(y - radius));
-    const right = Math.min(magicCanvas.width, Math.ceil(x + radius));
-    const bottom = Math.min(magicCanvas.height, Math.ceil(y + radius));
-    if (right <= left || bottom <= top) return;
-
-    magicContext.save();
-    magicContext.globalCompositeOperation = mode === "add"
-      ? "source-over"
-      : "destination-out";
-    magicContext.fillStyle = "rgba(83, 218, 190, 1)";
-    magicContext.beginPath();
-    magicContext.arc(x, y, radius, 0, Math.PI * 2);
-    magicContext.fill();
-    magicContext.restore();
-
-    if (mode === "add") {
-      const maskPixels = magicContext.getImageData(
-        left,
-        top,
-        right - left,
-        bottom - top,
-      );
-      const visiblePixels = workContext.getImageData(
-        left,
-        top,
-        right - left,
-        bottom - top,
-      ).data;
-      for (
-        let offset = 3;
-        offset < maskPixels.data.length;
-        offset += 4
-      ) {
-        if (visiblePixels[offset] <= 4) maskPixels.data[offset] = 0;
-      }
-      magicContext.putImageData(maskPixels, left, top);
-      const selection = magicSelectionRef.current;
-      magicSelectionRef.current = selection
-        ? {
-            left:Math.min(selection.left, left),
-            top:Math.min(selection.top, top),
-            right:Math.max(selection.right, right),
-            bottom:Math.max(selection.bottom, bottom),
-          }
-        : { left, top, right, bottom };
+    context.strokeStyle = "rgba(83, 218, 190, 0.92)";
+    if (fromX === toX && fromY === toY) {
+      context.beginPath();
+      context.arc(toX, toY, radius, 0, Math.PI * 2);
+      context.fill();
+    } else {
+      context.lineCap = "round";
+      context.lineJoin = "round";
+      context.lineWidth = radius * 2;
+      context.beginPath();
+      context.moveTo(fromX, fromY);
+      context.lineTo(toX, toY);
+      context.stroke();
     }
+    context.restore();
   }, []);
 
   const editMagicSelectionLine = useCallback((
@@ -711,31 +691,140 @@ export function RefineEditor({
     radius: number,
     mode: MagicEditMode,
   ) => {
-    const distance = Math.hypot(toX - fromX, toY - fromY);
-    const spacing = Math.max(1, radius * 0.28);
-    const steps = Math.max(1, Math.ceil(distance / spacing));
-    for (let step = 1; step <= steps; step += 1) {
-      const progress = step / steps;
-      editMagicSelectionStamp(
-        fromX + (toX - fromX) * progress,
-        fromY + (toY - fromY) * progress,
-        radius,
-        mode,
-      );
+    const magicCanvas = magicCanvasRef.current;
+    const magicContext = magicCanvas?.getContext("2d");
+    if (!magicCanvas || !magicContext) return;
+    const left = Math.max(
+      0,
+      Math.floor(Math.min(fromX, toX) - radius),
+    );
+    const top = Math.max(
+      0,
+      Math.floor(Math.min(fromY, toY) - radius),
+    );
+    const right = Math.min(
+      magicCanvas.width,
+      Math.ceil(Math.max(fromX, toX) + radius),
+    );
+    const bottom = Math.min(
+      magicCanvas.height,
+      Math.ceil(Math.max(fromY, toY) + radius),
+    );
+    if (right <= left || bottom <= top) return;
+
+    magicContext.save();
+    magicContext.globalCompositeOperation = mode === "add"
+      ? "source-over"
+      : "destination-out";
+    magicContext.fillStyle = "rgba(83, 218, 190, 1)";
+    magicContext.strokeStyle = "rgba(83, 218, 190, 1)";
+    if (fromX === toX && fromY === toY) {
+      magicContext.beginPath();
+      magicContext.arc(toX, toY, radius, 0, Math.PI * 2);
+      magicContext.fill();
+    } else {
+      magicContext.lineCap = "round";
+      magicContext.lineJoin = "round";
+      magicContext.lineWidth = radius * 2;
+      magicContext.beginPath();
+      magicContext.moveTo(fromX, fromY);
+      magicContext.lineTo(toX, toY);
+      magicContext.stroke();
     }
-  }, [editMagicSelectionStamp]);
+    magicContext.restore();
+
+    if (mode === "add") {
+      const selection = magicSelectionRef.current;
+      magicSelectionRef.current = selection
+        ? {
+            left:Math.min(selection.left, left),
+            top:Math.min(selection.top, top),
+            right:Math.max(selection.right, right),
+            bottom:Math.max(selection.bottom, bottom),
+          }
+        : { left, top, right, bottom };
+    }
+    return { left, top, right, bottom };
+  }, []);
+
+  const markMagicEditTiles = useCallback((
+    bounds: MagicSelection | undefined,
+    tiles: Set<number>,
+  ) => {
+    const canvas = magicCanvasRef.current;
+    if (!canvas || !bounds) return;
+    const columns = Math.ceil(canvas.width / MAGIC_EDIT_TILE_SIZE);
+    const firstX = Math.floor(bounds.left / MAGIC_EDIT_TILE_SIZE);
+    const lastX = Math.floor((bounds.right - 1) / MAGIC_EDIT_TILE_SIZE);
+    const firstY = Math.floor(bounds.top / MAGIC_EDIT_TILE_SIZE);
+    const lastY = Math.floor((bounds.bottom - 1) / MAGIC_EDIT_TILE_SIZE);
+    for (let tileY = firstY; tileY <= lastY; tileY += 1) {
+      for (let tileX = firstX; tileX <= lastX; tileX += 1) {
+        tiles.add(tileY * columns + tileX);
+      }
+    }
+  }, []);
+
+  const finishMagicEdit = useCallback((tiles: Set<number>) => {
+    const canvas = canvasRef.current;
+    const magicCanvas = magicCanvasRef.current;
+    const workContext = canvas?.getContext(
+      "2d",
+      { willReadFrequently:true },
+    );
+    const magicContext = magicCanvas?.getContext("2d");
+    if (!canvas || !magicCanvas || !workContext || !magicContext) return;
+    const columns = Math.ceil(magicCanvas.width / MAGIC_EDIT_TILE_SIZE);
+    for (const key of tiles) {
+      const tileX = key % columns;
+      const tileY = Math.floor(key / columns);
+      const left = tileX * MAGIC_EDIT_TILE_SIZE;
+      const top = tileY * MAGIC_EDIT_TILE_SIZE;
+      const width = Math.min(MAGIC_EDIT_TILE_SIZE, magicCanvas.width - left);
+      const height = Math.min(MAGIC_EDIT_TILE_SIZE, magicCanvas.height - top);
+      const maskPixels = magicContext.getImageData(
+        left,
+        top,
+        width,
+        height,
+      );
+      const visiblePixels = workContext.getImageData(
+        left,
+        top,
+        width,
+        height,
+      ).data;
+      for (
+        let offset = 3;
+        offset < maskPixels.data.length;
+        offset += 4
+      ) {
+        if (visiblePixels[offset] <= 4) maskPixels.data[offset] = 0;
+      }
+      magicContext.putImageData(maskPixels, left, top);
+    }
+  }, []);
 
   useEffect(() => {
     const viewport = viewportRef.current;
     if (!viewport) return;
-    const updateSize = () => setViewportSize({
-      width: viewport.clientWidth,
-      height: viewport.clientHeight,
-    });
+    const updateSize = () => {
+      viewportBoundsRef.current = viewport.getBoundingClientRect();
+      setViewportSize({
+        width: viewport.clientWidth,
+        height: viewport.clientHeight,
+      });
+    };
     updateSize();
     const observer = new ResizeObserver(updateSize);
     observer.observe(viewport);
     return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => () => {
+    if (brushFrameRef.current !== undefined) {
+      cancelAnimationFrame(brushFrameRef.current);
+    }
   }, []);
 
   useEffect(() => {
@@ -761,6 +850,9 @@ export function RefineEditor({
       if (magicCanvas) {
         magicCanvas.width = canvas.width;
         magicCanvas.height = canvas.height;
+        // Keep the interactive selection overlay GPU-backed. AI analysis reads
+        // it only at commit points; brush strokes update it continuously.
+        magicCanvas.getContext("2d");
       }
       context.clearRect(0, 0, canvas.width, canvas.height);
       context.drawImage(loadedProcessed.image, 0, 0);
@@ -830,29 +922,45 @@ export function RefineEditor({
     if (right <= left || bottom <= top) return;
 
     captureUndoTiles(context, left, top, right, bottom);
-    const localX = x - left;
-    const localY = y - top;
-    const gradient = context.createRadialGradient(
-      x,
-      y,
-      radius * 0.42,
-      x,
-      y,
-      radius,
-    );
-    gradient.addColorStop(0, "rgba(0, 0, 0, 1)");
-    gradient.addColorStop(0.55, "rgba(0, 0, 0, 1)");
-    gradient.addColorStop(1, "rgba(0, 0, 0, 0)");
-
     if (tool === "erase") {
+      let brush = eraseBrushRef.current;
+      if (!brush || Math.abs(brush.radius - radius) > 0.01) {
+        const brushCanvas = document.createElement("canvas");
+        const diameter = Math.max(2, Math.ceil(radius * 2));
+        brushCanvas.width = diameter;
+        brushCanvas.height = diameter;
+        const brushContext = brushCanvas.getContext("2d");
+        if (!brushContext) return;
+        const center = diameter / 2;
+        const gradient = brushContext.createRadialGradient(
+          center,
+          center,
+          radius * 0.42,
+          center,
+          center,
+          radius,
+        );
+        gradient.addColorStop(0, "rgba(0, 0, 0, 1)");
+        gradient.addColorStop(0.55, "rgba(0, 0, 0, 1)");
+        gradient.addColorStop(1, "rgba(0, 0, 0, 0)");
+        brushContext.fillStyle = gradient;
+        brushContext.fillRect(0, 0, diameter, diameter);
+        brush = { radius, canvas: brushCanvas };
+        eraseBrushRef.current = brush;
+      }
       context.save();
       context.globalCompositeOperation = "destination-out";
-      context.fillStyle = gradient;
-      context.fillRect(left, top, right - left, bottom - top);
+      context.drawImage(
+        brush.canvas,
+        x - brush.canvas.width / 2,
+        y - brush.canvas.height / 2,
+      );
       context.restore();
       return;
     }
 
+    const localX = x - left;
+    const localY = y - top;
     const brushCanvas = document.createElement("canvas");
     brushCanvas.width = right - left;
     brushCanvas.height = bottom - top;
@@ -1199,7 +1307,33 @@ export function RefineEditor({
         0,
         analysisWidth,
         analysisHeight,
-      ).data;
+      );
+      setMagicStatus("Refining AI highlight");
+      const refinedResult = await refineMagicSelectionMask(
+        result.mask,
+        visiblePixels.data,
+        analysisWidth,
+        analysisHeight,
+        points.map(point => ({
+          x: (point.x - left) * analysisScale,
+          y: (point.y - top) * analysisScale,
+          radius: Math.max(1, point.radius * analysisScale),
+        })),
+        controller.signal,
+      );
+      if (controller.signal.aborted) return;
+      if (
+        refinedResult.width !== analysisWidth
+        || refinedResult.height !== analysisHeight
+        || refinedResult.pixels.length !== analysisWidth * analysisHeight * 4
+      ) {
+        throw new Error("The AI returned an invalid refined highlight.");
+      }
+      if (!refinedResult.selectedPixelCount) {
+        throw new Error(
+          "The AI could not recognize an object under that stroke.",
+        );
+      }
       const preview = document.createElement("canvas");
       preview.width = analysisWidth;
       preview.height = analysisHeight;
@@ -1207,21 +1341,11 @@ export function RefineEditor({
       if (!previewContext) {
         throw new Error("Unable to preview the AI selection.");
       }
-      const previewPixels = previewContext.createImageData(
-        analysisWidth,
-        analysisHeight,
+      const previewPixels = new ImageData(
+        refinedResult.pixels,
+        refinedResult.width,
+        refinedResult.height,
       );
-      for (let index = 0; index < result.mask.length; index += 1) {
-        const offset = index * 4;
-        if (
-          result.mask[index] < MAGIC_MASK_ALPHA_THRESHOLD
-          || visiblePixels[offset + 3] <= 4
-        ) continue;
-        previewPixels.data[offset] = 83;
-        previewPixels.data[offset + 1] = 218;
-        previewPixels.data[offset + 2] = 190;
-        previewPixels.data[offset + 3] = 255;
-      }
       previewContext.putImageData(previewPixels, 0, 0);
 
       magicContext.clearRect(
@@ -1230,7 +1354,8 @@ export function RefineEditor({
         magicCanvas.width,
         magicCanvas.height,
       );
-      magicContext.imageSmoothingEnabled = false;
+      magicContext.imageSmoothingEnabled = true;
+      magicContext.imageSmoothingQuality = "high";
       magicContext.drawImage(
         preview,
         0,
@@ -1242,33 +1367,6 @@ export function RefineEditor({
         cropWidth,
         cropHeight,
       );
-      const fullResolutionMask = magicContext.getImageData(
-        left,
-        top,
-        cropWidth,
-        cropHeight,
-      );
-      const fullResolutionVisible = workContext.getImageData(
-        left,
-        top,
-        cropWidth,
-        cropHeight,
-      ).data;
-      const selectedPixelCount = refineAiSelectionPixels(
-        fullResolutionMask,
-        fullResolutionVisible,
-        cropWidth,
-        cropHeight,
-        points,
-        left,
-        top,
-      );
-      if (!selectedPixelCount) {
-        throw new Error(
-          "The AI could not recognize an object under that stroke.",
-        );
-      }
-      magicContext.putImageData(fullResolutionMask, left, top);
       magicSelectionRef.current = { left, top, right, bottom };
       setHasMagicSelection(true);
       setMagicEditMode("remove");
@@ -1894,22 +1992,38 @@ export function RefineEditor({
     }
   }, [clearMagicSelection]);
 
-  const canvasPoint = useCallback((clientX: number, clientY: number) => {
+  const createCanvasPointerMap = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const bounds = canvas.getBoundingClientRect();
-    if (
-      clientX < bounds.left
-      || clientX > bounds.right
-      || clientY < bounds.top
-      || clientY > bounds.bottom
-    ) return;
     return {
-      x: (clientX - bounds.left) * canvas.width / bounds.width,
-      y: (clientY - bounds.top) * canvas.height / bounds.height,
+      left: bounds.left,
+      top: bounds.top,
+      right: bounds.right,
+      bottom: bounds.bottom,
+      scaleX: canvas.width / bounds.width,
+      scaleY: canvas.height / bounds.height,
       radius: brushSize / 2 * canvas.width / bounds.width,
     };
   }, [brushSize]);
+
+  const canvasPoint = useCallback((
+    clientX: number,
+    clientY: number,
+    map: CanvasPointerMap,
+  ) => {
+    if (
+      clientX < map.left
+      || clientX > map.right
+      || clientY < map.top
+      || clientY > map.bottom
+    ) return;
+    return {
+      x: (clientX - map.left) * map.scaleX,
+      y: (clientY - map.top) * map.scaleY,
+      radius: map.radius,
+    };
+  }, []);
 
   const paintLine = useCallback((
     fromX: number,
@@ -1919,7 +2033,7 @@ export function RefineEditor({
     radius: number,
   ) => {
     const distance = Math.hypot(toX - fromX, toY - fromY);
-    const spacing = Math.max(1, radius * 0.28);
+    const spacing = Math.max(1, radius * 0.42);
     const steps = Math.max(1, Math.ceil(distance / spacing));
     for (let step = 1; step <= steps; step += 1) {
       const progress = step / steps;
@@ -2074,6 +2188,21 @@ export function RefineEditor({
     if (nextZoom <= MIN_ZOOM) setPan({ x: 0, y: 0 });
   };
 
+  const moveBrushCursor = useCallback((clientX: number, clientY: number) => {
+    const cursor = brushCursorRef.current;
+    const viewport = viewportRef.current;
+    if (!cursor || !viewport) return;
+    let bounds = viewportBoundsRef.current;
+    if (!bounds) {
+      bounds = viewport.getBoundingClientRect();
+      viewportBoundsRef.current = bounds;
+    }
+    cursor.style.transform = `translate3d(${
+      clientX - bounds.left
+    }px, ${clientY - bounds.top}px, 0) translate(-50%, -50%)`;
+    cursor.style.opacity = "1";
+  }, []);
+
   const onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
     if (isLoading || isAnalyzing || event.button > 1) return;
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -2088,22 +2217,32 @@ export function RefineEditor({
       };
       return;
     }
-    const point = canvasPoint(event.clientX, event.clientY);
+    const map = createCanvasPointerMap();
+    if (!map) return;
+    const point = canvasPoint(event.clientX, event.clientY, map);
     if (!point) return;
     if (tool === "magic") {
       if (hasMagicSelection) {
-        editMagicSelectionStamp(
+        const dirtyTiles = new Set<number>();
+        const editBounds = editMagicSelectionLine(
+          point.x,
+          point.y,
           point.x,
           point.y,
           point.radius,
           magicEditMode,
         );
+        if (magicEditMode === "add") {
+          markMagicEditTiles(editBounds, dirtyTiles);
+        }
         pointerActionRef.current = {
           type:"magic-edit",
           pointerId:event.pointerId,
           lastX:point.x,
           lastY:point.y,
           mode:magicEditMode,
+          map,
+          dirtyTiles,
         };
         return;
       }
@@ -2113,13 +2252,20 @@ export function RefineEditor({
         y:point.y,
         radius:point.radius,
       };
-      drawMagicHint(magicPoint);
+      drawMagicHint(
+        magicPoint.x,
+        magicPoint.y,
+        magicPoint.x,
+        magicPoint.y,
+        magicPoint.radius,
+      );
       pointerActionRef.current = {
         type:"magic",
         pointerId:event.pointerId,
         lastX:point.x,
         lastY:point.y,
         points:[magicPoint],
+        map,
       };
       return;
     }
@@ -2129,32 +2275,26 @@ export function RefineEditor({
       pointerId: event.pointerId,
       lastX: point.x,
       lastY: point.y,
+      map,
     };
     stamp(point.x, point.y, point.radius);
   };
 
-  const onPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
-    const viewport = viewportRef.current?.getBoundingClientRect();
-    if (viewport) {
-      setCursor({
-        x: event.clientX - viewport.left,
-        y: event.clientY - viewport.top,
-        visible: true,
-      });
-    }
+  const processBrushMove = (
+    pointerId: number,
+    clientX: number,
+    clientY: number,
+  ) => {
     const action = pointerActionRef.current;
-    if (!action || action.pointerId !== event.pointerId) return;
-    if (action.type === "pan") {
-      setPan({
-        x: action.originX + event.clientX - action.startX,
-        y: action.originY + event.clientY - action.startY,
-      });
-      return;
-    }
-    const point = canvasPoint(event.clientX, event.clientY);
+    if (
+      !action
+      || action.pointerId !== pointerId
+      || action.type === "pan"
+    ) return;
+    const point = canvasPoint(clientX, clientY, action.map);
     if (!point) return;
     if (action.type === "magic-edit") {
-      editMagicSelectionLine(
+      const editBounds = editMagicSelectionLine(
         action.lastX,
         action.lastY,
         point.x,
@@ -2162,6 +2302,9 @@ export function RefineEditor({
         point.radius,
         action.mode,
       );
+      if (action.mode === "add") {
+        markMagicEditTiles(editBounds, action.dirtyTiles);
+      }
       action.lastX = point.x;
       action.lastY = point.y;
       return;
@@ -2171,7 +2314,7 @@ export function RefineEditor({
         point.x - action.lastX,
         point.y - action.lastY,
       );
-      const spacing = Math.max(1, point.radius * 0.28);
+      const spacing = Math.max(1, point.radius * 0.42);
       const steps = Math.max(1, Math.ceil(distance / spacing));
       for (let step = 1; step <= steps; step += 1) {
         const progress = step / steps;
@@ -2181,8 +2324,14 @@ export function RefineEditor({
           radius:point.radius,
         };
         action.points.push(magicPoint);
-        drawMagicHint(magicPoint);
       }
+      drawMagicHint(
+        action.lastX,
+        action.lastY,
+        point.x,
+        point.y,
+        point.radius,
+      );
       action.lastX = point.x;
       action.lastY = point.y;
       return;
@@ -2192,10 +2341,75 @@ export function RefineEditor({
     action.lastY = point.y;
   };
 
-  const onPointerEnd = (event: React.PointerEvent<HTMLDivElement>) => {
+  const onPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    moveBrushCursor(event.clientX, event.clientY);
     const action = pointerActionRef.current;
     if (!action || action.pointerId !== event.pointerId) return;
+    if (action.type === "pan") {
+      setPan({
+        x: action.originX + event.clientX - action.startX,
+        y: action.originY + event.clientY - action.startY,
+      });
+      return;
+    }
+    pendingBrushMoveRef.current = {
+      pointerId: event.pointerId,
+      clientX: event.clientX,
+      clientY: event.clientY,
+    };
+    if (brushFrameRef.current !== undefined) return;
+    brushFrameRef.current = requestAnimationFrame(() => {
+      brushFrameRef.current = undefined;
+      const pending = pendingBrushMoveRef.current;
+      pendingBrushMoveRef.current = undefined;
+      if (pending) {
+        processBrushMove(
+          pending.pointerId,
+          pending.clientX,
+          pending.clientY,
+        );
+      }
+    });
+  };
+
+  const onPointerEnd = (event: React.PointerEvent<HTMLDivElement>) => {
+    let action = pointerActionRef.current;
+    if (!action || action.pointerId !== event.pointerId) return;
+    if (brushFrameRef.current !== undefined) {
+      cancelAnimationFrame(brushFrameRef.current);
+      brushFrameRef.current = undefined;
+    }
+    const pending = pendingBrushMoveRef.current;
+    pendingBrushMoveRef.current = undefined;
+    if (pending?.pointerId === event.pointerId) {
+      processBrushMove(
+        pending.pointerId,
+        pending.clientX,
+        pending.clientY,
+      );
+    }
+    action = pointerActionRef.current;
+    if (!action || action.pointerId !== event.pointerId) return;
+    if (action.type !== "pan") {
+      const endPoint = canvasPoint(
+        event.clientX,
+        event.clientY,
+        action.map,
+      );
+      if (
+        endPoint
+        && Math.hypot(
+          endPoint.x - action.lastX,
+          endPoint.y - action.lastY,
+        ) > 0.01
+      ) {
+        processBrushMove(event.pointerId, event.clientX, event.clientY);
+      }
+    }
     if (action.type === "paint") finishStroke();
+    if (action.type === "magic-edit" && action.mode === "add") {
+      finishMagicEdit(action.dirtyTiles);
+    }
     pointerActionRef.current = undefined;
     if (action.type === "magic") {
       if (event.type === "pointerup") {
@@ -2386,8 +2600,16 @@ export function RefineEditor({
           onPointerMove={onPointerMove}
           onPointerUp={onPointerEnd}
           onPointerCancel={onPointerEnd}
-          onPointerLeave={() => setCursor(current => ({ ...current, visible: false }))}
-          onPointerEnter={() => setCursor(current => ({ ...current, visible: true }))}
+          onPointerLeave={() => {
+            if (brushCursorRef.current) {
+              brushCursorRef.current.style.opacity = "0";
+            }
+          }}
+          onPointerEnter={event => {
+            viewportBoundsRef.current =
+              event.currentTarget.getBoundingClientRect();
+            moveBrushCursor(event.clientX, event.clientY);
+          }}
           onWheel={event => {
             event.preventDefault();
             setZoomLevel(zoom * (event.deltaY > 0 ? 0.88 : 1.14));
@@ -2419,15 +2641,17 @@ export function RefineEditor({
               <span>Opening full-resolution image…</span>
             </div>
           )}
-          {!isLoading && tool !== "move" && cursor.visible && (
+          {!isLoading && tool !== "move" && (
             <span
+              ref={brushCursorRef}
               className={`brush-cursor ${tool}`}
               aria-hidden="true"
               style={{
                 width: `${brushSize}px`,
                 height: `${brushSize}px`,
-                left: `${cursor.x}px`,
-                top: `${cursor.y}px`,
+                left: 0,
+                top: 0,
+                opacity: 0,
               }}
             />
           )}
