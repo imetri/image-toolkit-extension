@@ -10,6 +10,7 @@ type MagicMaskSeed = {
   x: number;
   y: number;
   radius: number;
+  label?: 0 | 1;
 };
 
 type WorkerRequest = {
@@ -25,12 +26,16 @@ type SelectionEngine = {
   processor: {
     _call: (
       image: RawImage,
-      options: { input_points:number[][][] },
+      options: {
+        input_points:number[][][];
+        input_labels:number[][];
+      },
     ) => Promise<{
       pixel_values: unknown;
       original_sizes: [number, number][];
       reshaped_input_sizes: [number, number][];
       input_points: unknown;
+      input_labels: unknown;
     }>;
     post_process_masks: (
       masks: unknown,
@@ -52,7 +57,8 @@ type SelectionEngine = {
 
 const workerScope = self as unknown as DedicatedWorkerGlobalScope;
 const MODEL_ID = "Xenova/slimsam-77-uniform";
-const MAX_PROMPT_POINTS = 16;
+const MAX_POSITIVE_POINTS = 14;
+const MAX_NEGATIVE_POINTS = 6;
 
 env.allowRemoteModels = false;
 env.allowLocalModels = true;
@@ -114,18 +120,37 @@ function switchToWasmEngine(id: string) {
   return enginePromise;
 }
 
-function samplePromptPoints(seeds: MagicMaskSeed[]) {
-  if (seeds.length <= MAX_PROMPT_POINTS) {
-    return seeds.map(seed => [seed.x, seed.y]);
-  }
-  const points: number[][] = [];
-  for (let index = 0; index < MAX_PROMPT_POINTS; index += 1) {
+function sampleSeeds(
+  seeds: MagicMaskSeed[],
+  maximum: number,
+) {
+  if (seeds.length <= maximum) return seeds;
+  const sampled: MagicMaskSeed[] = [];
+  for (let index = 0; index < maximum; index += 1) {
     const sourceIndex = Math.round(
-      index * (seeds.length - 1) / (MAX_PROMPT_POINTS - 1),
+      index * (seeds.length - 1) / (maximum - 1),
     );
-    points.push([seeds[sourceIndex].x, seeds[sourceIndex].y]);
+    sampled.push(seeds[sourceIndex]);
   }
-  return points;
+  return sampled;
+}
+
+function createPrompt(seeds: MagicMaskSeed[]) {
+  const positiveSeeds = sampleSeeds(
+    seeds.filter(seed => seed.label !== 0),
+    MAX_POSITIVE_POINTS,
+  );
+  const negativeSeeds = sampleSeeds(
+    seeds.filter(seed => seed.label === 0),
+    MAX_NEGATIVE_POINTS,
+  );
+  const promptSeeds = [...positiveSeeds, ...negativeSeeds];
+  return {
+    positiveSeeds,
+    negativeSeeds,
+    points:promptSeeds.map(seed => [seed.x, seed.y]),
+    labels:promptSeeds.map(seed => seed.label === 0 ? 0 : 1),
+  };
 }
 
 async function inferSelection(
@@ -138,10 +163,13 @@ async function inferSelection(
   if (!context) throw new Error("Unable to prepare the AI selection.");
   context.drawImage(bitmap, 0, 0);
 
-  const points = samplePromptPoints(seeds);
+  const prompt = createPrompt(seeds);
   const inputs = await engine.processor._call(
     RawImage.fromCanvas(canvas),
-    { input_points:[points] },
+    {
+      input_points:[prompt.points],
+      input_labels:[prompt.labels],
+    },
   );
   const outputs = await engine.model._call(inputs);
   const processedMasks = await engine.processor.post_process_masks(
@@ -156,12 +184,92 @@ async function inferSelection(
   const maskCount = Math.floor(masks.data.length / pixelCount);
   if (!maskCount) throw new Error("The AI selector returned an invalid mask.");
 
+  let focusLeft = bitmap.width;
+  let focusTop = bitmap.height;
+  let focusRight = 0;
+  let focusBottom = 0;
+  for (const seed of prompt.positiveSeeds) {
+    const radius = Math.max(2, seed.radius * 1.35);
+    focusLeft = Math.min(focusLeft, seed.x - radius);
+    focusTop = Math.min(focusTop, seed.y - radius);
+    focusRight = Math.max(focusRight, seed.x + radius);
+    focusBottom = Math.max(focusBottom, seed.y + radius);
+  }
+  focusLeft = Math.max(0, Math.floor(focusLeft));
+  focusTop = Math.max(0, Math.floor(focusTop));
+  focusRight = Math.min(bitmap.width - 1, Math.ceil(focusRight));
+  focusBottom = Math.min(bitmap.height - 1, Math.ceil(focusBottom));
+
   let bestMaskIndex = 0;
-  for (let index = 1; index < maskCount; index += 1) {
-    if (
-      Number(outputs.iou_scores.data[index] ?? 0)
-        > Number(outputs.iou_scores.data[bestMaskIndex] ?? 0)
-    ) bestMaskIndex = index;
+  let bestScore = Number.NEGATIVE_INFINITY;
+  for (let maskIndex = 0; maskIndex < maskCount; maskIndex += 1) {
+    const maskOffset = maskIndex * pixelCount;
+    let selectedArea = 0;
+    let focusedArea = 0;
+    let positiveHits = 0;
+    let negativeHits = 0;
+    for (let index = 0; index < pixelCount; index += 1) {
+      if (!masks.data[maskOffset + index]) continue;
+      selectedArea += 1;
+      const x = index % bitmap.width;
+      const y = Math.floor(index / bitmap.width);
+      if (
+        x >= focusLeft
+        && x <= focusRight
+        && y >= focusTop
+        && y <= focusBottom
+      ) focusedArea += 1;
+    }
+    for (const seed of prompt.positiveSeeds) {
+      const x = Math.max(0, Math.min(
+        bitmap.width - 1,
+        Math.round(seed.x),
+      ));
+      const y = Math.max(0, Math.min(
+        bitmap.height - 1,
+        Math.round(seed.y),
+      ));
+      if (masks.data[maskOffset + y * bitmap.width + x]) {
+        positiveHits += 1;
+      }
+    }
+    for (const seed of prompt.negativeSeeds) {
+      const x = Math.max(0, Math.min(
+        bitmap.width - 1,
+        Math.round(seed.x),
+      ));
+      const y = Math.max(0, Math.min(
+        bitmap.height - 1,
+        Math.round(seed.y),
+      ));
+      if (masks.data[maskOffset + y * bitmap.width + x]) {
+        negativeHits += 1;
+      }
+    }
+    const positiveCoverage = positiveHits / Math.max(
+      1,
+      prompt.positiveSeeds.length,
+    );
+    const negativeLeakage = negativeHits / Math.max(
+      1,
+      prompt.negativeSeeds.length,
+    );
+    const spatialLeakage = selectedArea > 0
+      ? 1 - focusedArea / selectedArea
+      : 1;
+    const predictedQuality = Number(
+      outputs.iou_scores.data[maskIndex] ?? 0,
+    );
+    const score = (
+      predictedQuality
+      + positiveCoverage * 2.5
+      - negativeLeakage * 3.5
+      - spatialLeakage * 2.25
+    );
+    if (score > bestScore) {
+      bestScore = score;
+      bestMaskIndex = maskIndex;
+    }
   }
 
   const selected = new Uint8ClampedArray(pixelCount);

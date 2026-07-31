@@ -4,6 +4,7 @@ export type MagicMaskSeed = {
   x: number;
   y: number;
   radius: number;
+  label?: 0 | 1;
 };
 
 type MagicMaskResult = {

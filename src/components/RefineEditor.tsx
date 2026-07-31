@@ -601,7 +601,7 @@ export function RefineEditor({
     const padding = Math.max(
       48,
       maximumRadius * 2.5,
-      Math.max(strokeWidth, strokeHeight) * 0.45,
+      Math.max(strokeWidth, strokeHeight) * 0.22,
     );
     let left = clamp(
       Math.floor(minimumX - padding),
@@ -689,6 +689,46 @@ export function RefineEditor({
     setMagicStatus("Preparing AI selection");
 
     try {
+      const ringLeft = minimumX - maximumRadius * 1.8;
+      const ringTop = minimumY - maximumRadius * 1.8;
+      const ringRight = maximumX + maximumRadius * 1.8;
+      const ringBottom = maximumY + maximumRadius * 1.8;
+      const ringMidX = (ringLeft + ringRight) / 2;
+      const ringMidY = (ringTop + ringBottom) / 2;
+      const negativeCandidates = [
+        [ringLeft, ringTop],
+        [ringMidX, ringTop],
+        [ringRight, ringTop],
+        [ringRight, ringMidY],
+        [ringRight, ringBottom],
+        [ringMidX, ringBottom],
+        [ringLeft, ringBottom],
+        [ringLeft, ringMidY],
+      ];
+      const negativeSeeds: Array<{
+        x:number;
+        y:number;
+        radius:number;
+        label:0;
+      }> = [];
+      for (const [candidateX, candidateY] of negativeCandidates) {
+        const x = Math.round(clamp(candidateX, 0, canvas.width - 1));
+        const y = Math.round(clamp(candidateY, 0, canvas.height - 1));
+        if (x < left || x >= right || y < top || y >= bottom) continue;
+        const isOutsideStroke = points.every(point => (
+          Math.hypot(x - point.x, y - point.y)
+            > point.radius * 1.45
+        ));
+        if (!isOutsideStroke) continue;
+        const alpha = workContext.getImageData(x, y, 1, 1).data[3];
+        if (alpha <= 16) continue;
+        negativeSeeds.push({
+          x:(x - left) * analysisScale,
+          y:(y - top) * analysisScale,
+          radius:Math.max(1, maximumRadius * analysisScale),
+          label:0,
+        });
+      }
       const cropBitmap = await createImageBitmap(cropCanvas);
       if (controller.signal.aborted) {
         cropBitmap.close();
@@ -696,11 +736,15 @@ export function RefineEditor({
       }
       const result = await createMagicSelectionMask(
         cropBitmap,
-        points.map(point => ({
-          x:(point.x - left) * analysisScale,
-          y:(point.y - top) * analysisScale,
-          radius:Math.max(1, point.radius * analysisScale),
-        })),
+        [
+          ...points.map(point => ({
+            x:(point.x - left) * analysisScale,
+            y:(point.y - top) * analysisScale,
+            radius:Math.max(1, point.radius * analysisScale),
+            label:1 as const,
+          })),
+          ...negativeSeeds,
+        ],
         controller.signal,
         update => setMagicStatus(update.stage),
       );
