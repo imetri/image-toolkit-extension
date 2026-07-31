@@ -26,6 +26,8 @@ type WorkerRequest =
     }
 
 const workerScope = self as unknown as DedicatedWorkerGlobalScope
+const IS_CHROME_EXTENSION =
+  workerScope.location.protocol === 'chrome-extension:'
 const MODEL_ID = 'studioludens/birefnet-lite-512'
 const MAX_INFERENCE_EDGE = 512
 const COMPONENT_THRESHOLD = 24
@@ -150,10 +152,19 @@ type MaskComponent = {
 env.allowRemoteModels = false
 env.allowLocalModels = true
 env.useBrowserCache = false
+// Transformers.js normally preloads ONNX Runtime's module factory into a blob
+// URL. Dedicated Chrome extension workers do not expose chrome.runtime, so the
+// library cannot detect MV3 here and Chrome rejects that blob dynamic import.
+// Use the factory and WASM asset bundled by Vite instead.
+env.useWasmCache = false
 env.localModelPath = new URL('/models/', workerScope.location.href).href
 // Let ONNX Runtime use multiple CPU cores when the host is cross-origin
-// isolated; it automatically falls back to one thread when that is unavailable.
-if (env.backends.onnx.wasm) env.backends.onnx.wasm.numThreads = 0
+// isolated. MV3 extension workers must stay single-threaded because ONNX's
+// pthread bootstrap creates another generated worker that Chrome can terminate.
+if (env.backends.onnx.wasm) {
+  env.backends.onnx.wasm.wasmPaths = undefined
+  env.backends.onnx.wasm.numThreads = IS_CHROME_EXTENSION ? 1 : 0
+}
 
 function report(id: string, progress: number, stage: string) {
   workerScope.postMessage({
@@ -188,7 +199,9 @@ let enginePromise: ReturnType<typeof createEngine> | undefined
 
 function getEngine(id: string) {
   if (enginePromise) return enginePromise
-  const canUseWebGpu = 'gpu' in workerScope.navigator
+  // WebGPU adapter/session startup is not reliable inside an MV3 dedicated
+  // extension worker. WASM is slower but works consistently in the side panel.
+  const canUseWebGpu = !IS_CHROME_EXTENSION && 'gpu' in workerScope.navigator
   enginePromise = canUseWebGpu
     ? createEngine(id, 'webgpu').catch(() => {
         report(id, 0.08, 'Using compatible CPU acceleration')

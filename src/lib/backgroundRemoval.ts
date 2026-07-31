@@ -92,7 +92,20 @@ function getWorker() {
     }
   }
   worker.onerror = event => {
+    console.error('The background-removal worker crashed.', {
+      message:event.message,
+      filename:event.filename,
+      line:event.lineno,
+      column:event.colno,
+      error:event.error,
+    })
     stopWorker(new Error(event.message || 'The background-removal engine stopped.'))
+  }
+  worker.onmessageerror = event => {
+    console.error('The background-removal worker returned unreadable data.', event)
+    stopWorker(new Error(
+      'The background-removal engine returned an unreadable result.',
+    ))
   }
   return worker
 }
