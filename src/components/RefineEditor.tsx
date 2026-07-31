@@ -470,6 +470,99 @@ export function RefineEditor({
     context.drawImage(brushCanvas, left, top);
   }, [captureUndoTiles, tool]);
 
+  const commitPaintedMagicSelection = useCallback((points: MagicPoint[]) => {
+    const canvas = canvasRef.current;
+    const magicCanvas = magicCanvasRef.current;
+    const workContext = canvas?.getContext(
+      "2d",
+      { willReadFrequently:true },
+    );
+    const magicContext = magicCanvas?.getContext(
+      "2d",
+      { willReadFrequently:true },
+    );
+    if (
+      !canvas
+      || !magicCanvas
+      || !workContext
+      || !magicContext
+      || !points.length
+    ) return;
+
+    let left = canvas.width;
+    let top = canvas.height;
+    let right = 0;
+    let bottom = 0;
+    magicContext.clearRect(
+      0,
+      0,
+      magicCanvas.width,
+      magicCanvas.height,
+    );
+    magicContext.save();
+    magicContext.fillStyle = "rgb(83, 218, 190)";
+    for (const point of points) {
+      left = Math.min(left, Math.floor(point.x - point.radius));
+      top = Math.min(top, Math.floor(point.y - point.radius));
+      right = Math.max(right, Math.ceil(point.x + point.radius));
+      bottom = Math.max(bottom, Math.ceil(point.y + point.radius));
+      magicContext.beginPath();
+      magicContext.arc(
+        point.x,
+        point.y,
+        point.radius,
+        0,
+        Math.PI * 2,
+      );
+      magicContext.fill();
+    }
+    magicContext.restore();
+
+    left = clamp(left, 0, canvas.width - 1);
+    top = clamp(top, 0, canvas.height - 1);
+    right = clamp(right, left + 1, canvas.width);
+    bottom = clamp(bottom, top + 1, canvas.height);
+    const width = right - left;
+    const height = bottom - top;
+    const maskPixels = magicContext.getImageData(
+      left,
+      top,
+      width,
+      height,
+    );
+    const visiblePixels = workContext.getImageData(
+      left,
+      top,
+      width,
+      height,
+    ).data;
+    let selectedPixelCount = 0;
+    for (
+      let offset = 3;
+      offset < maskPixels.data.length;
+      offset += 4
+    ) {
+      const selected = (
+        maskPixels.data[offset] >= MAGIC_MASK_ALPHA_THRESHOLD
+        && visiblePixels[offset] > 4
+      );
+      maskPixels.data[offset] = selected ? 255 : 0;
+      if (selected) selectedPixelCount += 1;
+    }
+    magicContext.putImageData(maskPixels, left, top);
+    if (!selectedPixelCount) {
+      clearMagicSelection();
+      setError("Paint over visible pixels to create a highlight.");
+      return;
+    }
+
+    magicSelectionRef.current = { left, top, right, bottom };
+    setHasMagicSelection(true);
+    setMagicEditMode("remove");
+    setMagicStatus("Highlight ready");
+    setError("");
+  }, [clearMagicSelection]);
+
   const analyzeMagicSelection = useCallback(async (points: MagicPoint[]) => {
     const canvas = canvasRef.current;
     const magicCanvas = magicCanvasRef.current;
@@ -1376,7 +1469,7 @@ export function RefineEditor({
     pointerActionRef.current = undefined;
     if (action.type === "magic") {
       if (event.type === "pointerup") {
-        void analyzeMagicSelection(action.points);
+        commitPaintedMagicSelection(action.points);
       } else {
         clearMagicSelection();
       }
@@ -1437,10 +1530,10 @@ export function RefineEditor({
               onClick={() => selectTool("magic")}
               aria-pressed={tool === "magic"}
               disabled={isAnalyzing}
-              title="Paint a hint for AI selection (W)"
+              title="Paint visible pixels to highlight them (W)"
             >
               <WandSparkles size={17} />
-              <span>AI Select</span>
+              <span>Smart Select</span>
             </button>
             <button
               type="button"
@@ -1658,7 +1751,7 @@ export function RefineEditor({
                   : tool === "move"
                     ? "Drag to move. Scroll to zoom."
                     : tool === "magic"
-                      ? "Paint loosely over one area. AI will highlight its exact region."
+                      ? "Paint over visible pixels. Transparent gaps stay excluded."
                       : "Paint over the image. Use [ and ] to resize the brush."
             )}
           </p>
