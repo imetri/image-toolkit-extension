@@ -1,8 +1,10 @@
 import {
   AutoImageProcessor,
   AutoModel,
+  AutoProcessor,
   env,
   RawImage,
+  SamModel,
   type ProgressInfo,
 } from '@huggingface/transformers'
 
@@ -27,6 +29,10 @@ type WorkerRequest =
 
 const workerScope = self as unknown as DedicatedWorkerGlobalScope
 const MODEL_ID = 'studioludens/birefnet-lite-512'
+const SELECTION_MODEL_ID = 'Xenova/slimsam-77-uniform'
+const MAX_SELECTION_POINTS = 16
+const SELECTION_CORRIDOR_SCALE = 1.55
+const SELECTION_NEGATIVE_RING_SCALE = 1.8
 const MAX_INFERENCE_EDGE = 512
 const COMPONENT_THRESHOLD = 24
 const REFINEMENT_PADDING = 0.14
@@ -94,10 +100,6 @@ const COLOR_ISLAND_MAX_CLEARANCE_FRACTION = 0.08
 const COLOR_ISLAND_GROWTH_PADDING = 12
 const COLOR_ISLAND_EXPANSION_RADIUS = 0
 const COLOR_ISLAND_FEATHER_RADIUS = 2
-const MAGIC_SELECTION_THRESHOLD = 32
-const MAGIC_COMPONENT_PADDING = 0.1
-const MAGIC_HINT_PADDING_SCALE = 2.5
-const MAGIC_MAX_COMPONENT_TO_HINT_AREA_RATIO = 4
 const ALPHA_FILTER_RADIUS = 2
 const ALPHA_FILTER_PASSES = 2
 const MAX_COLOR_EDGE_RADIUS = 24
@@ -202,6 +204,312 @@ function switchToWasmEngine(id: string) {
   report(id, 0.08, 'Using compatible CPU acceleration')
   enginePromise = createEngine(id, 'wasm')
   return enginePromise
+}
+
+type SelectionEngine = {
+  processor: {
+    _call: (
+      image: RawImage,
+      options: {
+        input_points: number[][][]
+        input_labels: number[][]
+      },
+    ) => Promise<{
+      pixel_values: unknown
+      original_sizes: [number, number][]
+      reshaped_input_sizes: [number, number][]
+      input_points: unknown
+      input_labels: unknown
+    }>
+    post_process_masks: (
+      masks: unknown,
+      originalSizes: [number, number][],
+      reshapedInputSizes: [number, number][],
+    ) => Promise<Array<{
+      data: Uint8Array
+      dims: number[]
+    }>>
+  }
+  model: {
+    _call: (inputs: object) => Promise<{
+      pred_masks: unknown
+      iou_scores: {
+        data: Float32Array
+      }
+    }>
+  }
+  device: InferenceDevice
+}
+
+function createSelectionEngine(
+  id: string,
+  device: InferenceDevice,
+): Promise<SelectionEngine> {
+  const options = {
+    device,
+    dtype:'q8',
+    progress_callback: (update: ProgressInfo) => {
+      const percent = (
+        'progress' in update && typeof update.progress === 'number'
+      ) ? update.progress / 100 : 0
+      report(id, 0.04 + percent * 0.4, 'Loading interactive selection model')
+    },
+  } as const
+
+  return Promise.all([
+    AutoProcessor.from_pretrained(SELECTION_MODEL_ID, options),
+    SamModel.from_pretrained(SELECTION_MODEL_ID, options),
+  ]).then(([processor, model]) => ({
+    processor,
+    model,
+    device,
+  }) as unknown as SelectionEngine)
+}
+
+let selectionEnginePromise:
+  Promise<SelectionEngine> | undefined
+
+function getSelectionEngine(id: string) {
+  if (selectionEnginePromise) return selectionEnginePromise
+  const canUseWebGpu = 'gpu' in workerScope.navigator
+  selectionEnginePromise = canUseWebGpu
+    ? createSelectionEngine(id, 'webgpu').catch(() => {
+        report(id, 0.08, 'Using compatible CPU acceleration')
+        return createSelectionEngine(id, 'wasm')
+      })
+    : createSelectionEngine(id, 'wasm')
+  return selectionEnginePromise
+}
+
+function switchToWasmSelectionEngine(id: string) {
+  report(id, 0.08, 'Using compatible CPU acceleration')
+  selectionEnginePromise = createSelectionEngine(id, 'wasm')
+  return selectionEnginePromise
+}
+
+function sampleSelectionSeeds(seeds: MagicMaskSeed[]) {
+  if (seeds.length <= MAX_SELECTION_POINTS) return seeds
+  const sampled: MagicMaskSeed[] = []
+  for (let index = 0; index < MAX_SELECTION_POINTS; index += 1) {
+    const sourceIndex = Math.round(
+      index * (seeds.length - 1) / (MAX_SELECTION_POINTS - 1),
+    )
+    sampled.push(seeds[sourceIndex])
+  }
+  return sampled
+}
+
+function createSelectionPrompt(
+  seeds: MagicMaskSeed[],
+  width: number,
+  height: number,
+) {
+  const sampledSeeds = sampleSelectionSeeds(seeds)
+  let left = width
+  let top = height
+  let right = 0
+  let bottom = 0
+  for (const seed of seeds) {
+    const radius = Math.max(
+      2,
+      seed.radius * SELECTION_NEGATIVE_RING_SCALE,
+    )
+    left = Math.min(left, seed.x - radius)
+    top = Math.min(top, seed.y - radius)
+    right = Math.max(right, seed.x + radius)
+    bottom = Math.max(bottom, seed.y + radius)
+  }
+  const positivePoints = sampledSeeds.map(seed => [
+    Math.max(0, Math.min(width - 1, seed.x)),
+    Math.max(0, Math.min(height - 1, seed.y)),
+  ])
+  const midpointX = (left + right) / 2
+  const midpointY = (top + bottom) / 2
+  const negativePoints = [
+    [left, top],
+    [midpointX, top],
+    [right, top],
+    [right, midpointY],
+    [right, bottom],
+    [midpointX, bottom],
+    [left, bottom],
+    [left, midpointY],
+  ].map(([x, y]) => [
+    Math.max(0, Math.min(width - 1, x)),
+    Math.max(0, Math.min(height - 1, y)),
+  ])
+  return {
+    points:[...positivePoints, ...negativePoints],
+    labels:[
+      ...positivePoints.map(() => 1),
+      ...negativePoints.map(() => 0),
+    ],
+    positivePointCount:positivePoints.length,
+  }
+}
+
+function createSelectionCorridor(
+  seeds: MagicMaskSeed[],
+  width: number,
+  height: number,
+) {
+  const corridor = new Uint8Array(width * height)
+  for (const seed of seeds) {
+    const radius = Math.max(2, seed.radius * SELECTION_CORRIDOR_SCALE)
+    const left = Math.max(0, Math.floor(seed.x - radius))
+    const top = Math.max(0, Math.floor(seed.y - radius))
+    const right = Math.min(width - 1, Math.ceil(seed.x + radius))
+    const bottom = Math.min(height - 1, Math.ceil(seed.y + radius))
+    const radiusSquared = radius * radius
+    for (let y = top; y <= bottom; y += 1) {
+      const vertical = y + 0.5 - seed.y
+      const row = y * width
+      for (let x = left; x <= right; x += 1) {
+        const horizontal = x + 0.5 - seed.x
+        if (
+          horizontal * horizontal + vertical * vertical
+            <= radiusSquared
+        ) corridor[row + x] = 1
+      }
+    }
+  }
+  return corridor
+}
+
+async function runSelectionInference(
+  engine: SelectionEngine,
+  bitmap: ImageBitmap,
+  seeds: MagicMaskSeed[],
+) {
+  const canvas = new OffscreenCanvas(bitmap.width, bitmap.height)
+  const context = canvas.getContext('2d', { alpha:false })
+  if (!context) throw new Error('Unable to prepare the AI selection.')
+  context.drawImage(bitmap, 0, 0)
+  const image = RawImage.fromCanvas(canvas)
+  const prompt = createSelectionPrompt(
+    seeds,
+    bitmap.width,
+    bitmap.height,
+  )
+  const inputs = await engine.processor._call(image, {
+    input_points:[prompt.points],
+    input_labels:[prompt.labels],
+  })
+  const outputs = await engine.model._call(inputs)
+  const masks = await engine.processor.post_process_masks(
+    outputs.pred_masks,
+    inputs.original_sizes,
+    inputs.reshaped_input_sizes,
+  )
+  const mask = masks[0]
+  if (!mask) throw new Error('The interactive selection model returned no mask.')
+
+  const pixelCount = bitmap.width * bitmap.height
+  const maskCount = Math.floor(mask.data.length / pixelCount)
+  if (!maskCount) {
+    throw new Error('The interactive selection model returned an invalid mask.')
+  }
+  const corridor = createSelectionCorridor(
+    seeds,
+    bitmap.width,
+    bitmap.height,
+  )
+  let corridorArea = 0
+  for (const value of corridor) corridorArea += value
+
+  let bestMaskIndex = 0
+  let bestScore = Number.NEGATIVE_INFINITY
+  for (let maskIndex = 0; maskIndex < maskCount; maskIndex += 1) {
+    const maskOffset = maskIndex * pixelCount
+    let selectedArea = 0
+    let selectedInsideCorridor = 0
+    let positiveHits = 0
+    let negativeHits = 0
+    for (let index = 0; index < pixelCount; index += 1) {
+      if (!mask.data[maskOffset + index]) continue
+      selectedArea += 1
+      if (corridor[index]) selectedInsideCorridor += 1
+    }
+    for (
+      let pointIndex = 0;
+      pointIndex < prompt.points.length;
+      pointIndex += 1
+    ) {
+      const point = prompt.points[pointIndex]
+      const x = Math.max(0, Math.min(
+        bitmap.width - 1,
+        Math.round(point[0]),
+      ))
+      const y = Math.max(0, Math.min(
+        bitmap.height - 1,
+        Math.round(point[1]),
+      ))
+      if (mask.data[maskOffset + y * bitmap.width + x]) {
+        if (pointIndex < prompt.positivePointCount) {
+          positiveHits += 1
+        } else {
+          negativeHits += 1
+        }
+      }
+    }
+    const promptCoverage = (
+      positiveHits / Math.max(1, prompt.positivePointCount)
+    )
+    const negativeLeakage = negativeHits / Math.max(
+      1,
+      prompt.points.length - prompt.positivePointCount,
+    )
+    const leakage = selectedArea > 0
+      ? 1 - selectedInsideCorridor / selectedArea
+      : 1
+    const corridorCoverage = corridorArea > 0
+      ? selectedInsideCorridor / corridorArea
+      : 0
+    const predictedQuality = Number(
+      outputs.iou_scores.data[maskIndex] ?? 0,
+    )
+    const score = (
+      promptCoverage * 3
+      + predictedQuality
+      + Math.min(0.65, corridorCoverage) * 0.45
+      - leakage * 3.5
+      - negativeLeakage * 2
+    )
+    if (score > bestScore) {
+      bestScore = score
+      bestMaskIndex = maskIndex
+    }
+  }
+
+  const selected = new Uint8ClampedArray(pixelCount)
+  const bestOffset = bestMaskIndex * pixelCount
+  for (let index = 0; index < pixelCount; index += 1) {
+    // SAM supplies the edge; the painted corridor is only a locality guard.
+    // This prevents a valid mask from jumping onto another touching object.
+    if (corridor[index] && mask.data[bestOffset + index]) {
+      selected[index] = 255
+    }
+  }
+  return selected
+}
+
+async function createPromptedSelection(
+  id: string,
+  bitmap: ImageBitmap,
+  seeds: MagicMaskSeed[],
+) {
+  if (!seeds.length) {
+    throw new Error('Paint over the area you want AI Select to find.')
+  }
+  let engine = await getSelectionEngine(id)
+  report(id, 0.5, 'Understanding the painted object')
+  try {
+    return await runSelectionInference(engine, bitmap, seeds)
+  } catch (error) {
+    if (engine.device !== 'webgpu') throw error
+    engine = await switchToWasmSelectionEngine(id)
+    return runSelectionInference(engine, bitmap, seeds)
+  }
 }
 
 function createInferenceCanvas(
@@ -587,169 +895,6 @@ function rectOverlap(first: SourceRect, second: SourceRect) {
     + second.width * second.height
     - intersection
   return intersection / union
-}
-
-function rectsIntersect(first: SourceRect, second: SourceRect) {
-  return (
-    first.left < second.left + second.width
-    && first.left + first.width > second.left
-    && first.top < second.top + second.height
-    && first.top + first.height > second.top
-  )
-}
-
-function createMagicHintRect(
-  seeds: MagicMaskSeed[],
-  imageWidth: number,
-  imageHeight: number,
-) {
-  let left = imageWidth
-  let top = imageHeight
-  let right = 0
-  let bottom = 0
-  let maximumRadius = 1
-  for (const seed of seeds) {
-    const radius = Math.max(1, seed.radius)
-    maximumRadius = Math.max(maximumRadius, radius)
-    left = Math.min(left, seed.x - radius)
-    top = Math.min(top, seed.y - radius)
-    right = Math.max(right, seed.x + radius)
-    bottom = Math.max(bottom, seed.y + radius)
-  }
-  const padding = Math.max(24, maximumRadius * MAGIC_HINT_PADDING_SCALE)
-  left = Math.max(0, Math.floor(left - padding))
-  top = Math.max(0, Math.floor(top - padding))
-  right = Math.min(imageWidth, Math.ceil(right + padding))
-  bottom = Math.min(imageHeight, Math.ceil(bottom + padding))
-  return {
-    left,
-    top,
-    width:Math.max(1, right - left),
-    height:Math.max(1, bottom - top),
-  }
-}
-
-function findSeededMagicComponent(
-  mask: RawImage,
-  imageWidth: number,
-  imageHeight: number,
-  seeds: MagicMaskSeed[],
-) {
-  const pixelCount = mask.width * mask.height
-  const seedMask = new Uint8Array(pixelCount)
-  for (const seed of seeds) {
-    const centerX = seed.x / imageWidth * mask.width
-    const centerY = seed.y / imageHeight * mask.height
-    const radiusX = Math.max(1, seed.radius / imageWidth * mask.width)
-    const radiusY = Math.max(1, seed.radius / imageHeight * mask.height)
-    const left = Math.max(0, Math.floor(centerX - radiusX))
-    const top = Math.max(0, Math.floor(centerY - radiusY))
-    const right = Math.min(mask.width - 1, Math.ceil(centerX + radiusX))
-    const bottom = Math.min(mask.height - 1, Math.ceil(centerY + radiusY))
-    for (let y = top; y <= bottom; y += 1) {
-      const normalizedY = (y + 0.5 - centerY) / radiusY
-      for (let x = left; x <= right; x += 1) {
-        const normalizedX = (x + 0.5 - centerX) / radiusX
-        if (
-          normalizedX * normalizedX + normalizedY * normalizedY <= 1
-        ) {
-          seedMask[y * mask.width + x] = 1
-        }
-      }
-    }
-  }
-
-  let paintedAlpha = 0
-  let paintedCount = 0
-  for (let index = 0; index < pixelCount; index += 1) {
-    if (!seedMask[index]) continue
-    paintedAlpha += mask.data[index]
-    paintedCount += 1
-  }
-  if (!paintedCount) return undefined
-  const selectForeground = paintedAlpha / paintedCount >= 127.5
-  const candidates = new Uint8Array(pixelCount)
-  const selected = new Uint8Array(pixelCount)
-  const queue = new Int32Array(pixelCount)
-  let write = 0
-
-  for (let index = 0; index < pixelCount; index += 1) {
-    const sideStrength = selectForeground
-      ? mask.data[index]
-      : 255 - mask.data[index]
-    if (sideStrength < MAGIC_SELECTION_THRESHOLD) continue
-    candidates[index] = 1
-    if (seedMask[index]) {
-      selected[index] = 1
-      queue[write++] = index
-    }
-  }
-  if (!write) return undefined
-
-  let minX = mask.width
-  let minY = mask.height
-  let maxX = -1
-  let maxY = -1
-  for (let read = 0; read < write; read += 1) {
-    const index = queue[read]
-    const x = index % mask.width
-    const y = Math.floor(index / mask.width)
-    minX = Math.min(minX, x)
-    minY = Math.min(minY, y)
-    maxX = Math.max(maxX, x)
-    maxY = Math.max(maxY, y)
-
-    if (x > 0) {
-      const neighbor = index - 1
-      if (!selected[neighbor] && candidates[neighbor]) {
-        selected[neighbor] = 1
-        queue[write++] = neighbor
-      }
-    }
-    if (x < mask.width - 1) {
-      const neighbor = index + 1
-      if (!selected[neighbor] && candidates[neighbor]) {
-        selected[neighbor] = 1
-        queue[write++] = neighbor
-      }
-    }
-    if (y > 0) {
-      const neighbor = index - mask.width
-      if (!selected[neighbor] && candidates[neighbor]) {
-        selected[neighbor] = 1
-        queue[write++] = neighbor
-      }
-    }
-    if (y < mask.height - 1) {
-      const neighbor = index + mask.width
-      if (!selected[neighbor] && candidates[neighbor]) {
-        selected[neighbor] = 1
-        queue[write++] = neighbor
-      }
-    }
-  }
-
-  let left = Math.floor(minX / mask.width * imageWidth)
-  let top = Math.floor(minY / mask.height * imageHeight)
-  let right = Math.ceil((maxX + 1) / mask.width * imageWidth)
-  let bottom = Math.ceil((maxY + 1) / mask.height * imageHeight)
-  const padding = Math.max(
-    4,
-    Math.round(Math.max(right - left, bottom - top) * MAGIC_COMPONENT_PADDING),
-  )
-  left = Math.max(0, left - padding)
-  top = Math.max(0, top - padding)
-  right = Math.min(imageWidth, right + padding)
-  bottom = Math.min(imageHeight, bottom + padding)
-  return {
-    selectForeground,
-    source:{
-      left,
-      top,
-      width:Math.max(1, right - left),
-      height:Math.max(1, bottom - top),
-    },
-  }
 }
 
 function summedArea(
@@ -2177,23 +2322,38 @@ function applyFullResolutionAlpha(
 workerScope.onmessage = async ({ data }: MessageEvent<WorkerRequest>) => {
   let bitmap: ImageBitmap | undefined
   try {
-    const isMagicSelection = data.type === 'select-region'
+    if (data.type === 'select-region') {
+      bitmap = data.image
+      report(data.id, 0.02, 'Starting interactive AI selection')
+      const alpha = await createPromptedSelection(
+        data.id,
+        bitmap,
+        data.seeds,
+      )
+      const maskBuffer = alpha.buffer as ArrayBuffer
+      report(data.id, 0.98, 'Highlight ready')
+      workerScope.postMessage({
+        type:'mask-result',
+        id:data.id,
+        mask:maskBuffer,
+        width:bitmap.width,
+        height:bitmap.height,
+      }, [maskBuffer])
+      return
+    }
+
     report(
       data.id,
       0.02,
-      isMagicSelection
-        ? 'Starting fast AI selection'
-        : 'Starting background-removal engine',
+      'Starting background-removal engine',
     )
     let engine = await getEngine(data.id)
     report(
       data.id,
       0.47,
-      isMagicSelection ? 'Reading painted area' : 'Decoding source image',
+      'Decoding source image',
     )
-    bitmap = data.type === 'select-region'
-      ? data.image
-      : await createImageBitmap(data.image)
+    bitmap = await createImageBitmap(data.image)
 
     const wholeImage = {
       left:0,
@@ -2204,7 +2364,7 @@ workerScope.onmessage = async ({ data }: MessageEvent<WorkerRequest>) => {
     report(
       data.id,
       0.53,
-      isMagicSelection ? 'Finding the painted region' : 'Finding the foreground',
+      'Finding the foreground',
     )
     const baseInference = await inferMaskWithFallback(
       data.id,
@@ -2214,50 +2374,19 @@ workerScope.onmessage = async ({ data }: MessageEvent<WorkerRequest>) => {
     engine = baseInference.engine
     const baseMask = baseInference.mask
     const layers: MaskLayer[] = [{ mask:baseMask, source:wholeImage }]
-    let refinementLayers = findAllRefinementLayers(
+    const refinementLayers = findAllRefinementLayers(
       baseMask,
       bitmap.width,
       bitmap.height,
     )
-    if (isMagicSelection) {
-      // The final UI selection is seed-connected, so refinements that cannot
-      // touch that component only add latency without changing its result.
-      const hintRect = createMagicHintRect(
-        data.seeds,
-        bitmap.width,
-        bitmap.height,
-      )
-      const seededComponent = findSeededMagicComponent(
-        baseMask,
-        bitmap.width,
-        bitmap.height,
-        data.seeds,
-      )
-      const componentArea = seededComponent
-        ? seededComponent.source.width * seededComponent.source.height
-        : Number.POSITIVE_INFINITY
-      const hintArea = hintRect.width * hintRect.height
-      const focusRect = (
-        seededComponent?.selectForeground
-        && componentArea
-          <= hintArea * MAGIC_MAX_COMPONENT_TO_HINT_AREA_RATIO
-      )
-        ? seededComponent.source
-        : hintRect
-      refinementLayers = refinementLayers.filter(
-        layer => rectsIntersect(layer.source, focusRect),
-      )
-    }
 
     for (let index = 0; index < refinementLayers.length; index += 1) {
       const refinementLayer = refinementLayers[index]
-      const stage = isMagicSelection
-        ? `Refining painted edge ${index + 1} of ${refinementLayers.length}`
-        : refinementLayer.detail === 'hair'
-          ? 'Refining hair and upper-body gaps'
-          : refinementLayer.detail === 'edge'
-            ? 'Refining high-quality hair and fur edges'
-            : `Refining subject ${index + 1} of ${refinementLayers.length}`
+      const stage = refinementLayer.detail === 'hair'
+        ? 'Refining hair and upper-body gaps'
+        : refinementLayer.detail === 'edge'
+          ? 'Refining high-quality hair and fur edges'
+          : `Refining subject ${index + 1} of ${refinementLayers.length}`
       report(
         data.id,
         0.68 + (index / refinementLayers.length) * 0.16,
@@ -2279,9 +2408,7 @@ workerScope.onmessage = async ({ data }: MessageEvent<WorkerRequest>) => {
     report(
       data.id,
       0.86,
-      isMagicSelection
-        ? 'Snapping highlight to image edges'
-        : 'Snapping the matte to full-resolution edges',
+      'Snapping the matte to full-resolution edges',
     )
     const outputCanvas = new OffscreenCanvas(bitmap.width, bitmap.height)
     const outputContext = outputCanvas.getContext('2d', { alpha:true })
@@ -2294,21 +2421,8 @@ workerScope.onmessage = async ({ data }: MessageEvent<WorkerRequest>) => {
       bitmap.width,
       bitmap.height,
       layers,
-      isMagicSelection ? 'mask' : 'image',
+      'image',
     )
-
-    if (isMagicSelection) {
-      const maskBuffer = alpha.buffer as ArrayBuffer
-      report(data.id, 0.98, 'Highlight ready')
-      workerScope.postMessage({
-        type:'mask-result',
-        id:data.id,
-        mask:maskBuffer,
-        width:bitmap.width,
-        height:bitmap.height,
-      }, [maskBuffer])
-      return
-    }
     const blob = await outputCanvas.convertToBlob({ type:'image/png' })
     report(data.id, 0.98, 'Finishing transparent PNG')
     workerScope.postMessage({
