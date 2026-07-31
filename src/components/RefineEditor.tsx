@@ -89,6 +89,22 @@ const MAX_ZOOM = 8;
 const UNDO_LIMIT = 12;
 const UNDO_TILE_SIZE = 128;
 const MAGIC_MASK_ALPHA_THRESHOLD = 128;
+const MAGIC_HINT_CORE_RADIUS_SCALE = 0.26;
+const MAGIC_GROWTH_RADIUS_SCALE = 1.35;
+const MAGIC_ENDPOINT_GROWTH_RADIUS_SCALE = 0.45;
+const MAGIC_ENDPOINT_TAPER_DISTANCE_SCALE = 0.9;
+const MAGIC_POINT_COLOR_TOLERANCE = 110;
+const MAGIC_POINT_LUMINANCE_TOLERANCE = 82;
+const MAGIC_POINT_CHROMA_TOLERANCE = 56;
+const MAGIC_POINT_MODEL_TOLERANCE = 160;
+const MAGIC_SOFT_COLOR_TOLERANCE = 148;
+const MAGIC_SOFT_LUMINANCE_TOLERANCE = 116;
+const MAGIC_SOFT_CHROMA_TOLERANCE = 84;
+const MAGIC_SOFT_MODEL_TOLERANCE = 216;
+const MAGIC_HOLE_FILL_PASSES = 3;
+const MAGIC_LOCAL_EDGE_COLOR_TOLERANCE = 104;
+const MAGIC_LOCAL_EDGE_ALPHA_TOLERANCE = 96;
+const MAGIC_LOCAL_EDGE_MODEL_TOLERANCE = 160;
 
 function loadImage(blob: Blob): Promise<LoadedImage> {
   return new Promise((resolve, reject) => {
@@ -457,11 +473,13 @@ export function RefineEditor({
   const analyzeMagicSelection = useCallback(async (points: MagicPoint[]) => {
     const canvas = canvasRef.current;
     const magicCanvas = magicCanvasRef.current;
+    const source = sourceImageRef.current;
     const workContext = canvas?.getContext("2d", { willReadFrequently: true });
     const magicContext = magicCanvas?.getContext("2d");
     if (
       !canvas
       || !magicCanvas
+      || !source
       || !workContext
       || !magicContext
       || !points.length
@@ -525,19 +543,26 @@ export function RefineEditor({
       setError("Unable to prepare the AI selection.");
       return;
     }
-    cropContext.fillStyle = "#f4f4f5";
-    cropContext.fillRect(0, 0, analysisWidth, analysisHeight);
+    const sourceScaleX = source.naturalWidth / canvas.width;
+    const sourceScaleY = source.naturalHeight / canvas.height;
     cropContext.drawImage(
-      canvas,
-      left,
-      top,
-      cropWidth,
-      cropHeight,
+      source,
+      left * sourceScaleX,
+      top * sourceScaleY,
+      cropWidth * sourceScaleX,
+      cropHeight * sourceScaleY,
       0,
       0,
       analysisWidth,
       analysisHeight,
     );
+    const sourcePixels = cropContext.getImageData(
+      0,
+      0,
+      analysisWidth,
+      analysisHeight,
+    ).data;
+
     magicAbortRef.current?.abort();
     const controller = new AbortController();
     magicAbortRef.current = controller;
@@ -548,6 +573,14 @@ export function RefineEditor({
 
     try {
       const analysisSeeds = points.map(point => ({
+        x: (point.x - left) * analysisScale,
+        y: (point.y - top) * analysisScale,
+        radius: Math.max(
+          1,
+          point.radius * analysisScale * MAGIC_HINT_CORE_RADIUS_SCALE,
+        ),
+      }));
+      const analysisPaintPoints = points.map(point => ({
         x: (point.x - left) * analysisScale,
         y: (point.y - top) * analysisScale,
         radius: Math.max(1, point.radius * analysisScale),
@@ -572,6 +605,7 @@ export function RefineEditor({
         throw new Error("The AI returned an invalid selection mask.");
       }
       const resultPixels = result.mask;
+
       const visibleCanvas = document.createElement("canvas");
       visibleCanvas.width = analysisWidth;
       visibleCanvas.height = analysisHeight;
@@ -597,19 +631,333 @@ export function RefineEditor({
         analysisWidth,
         analysisHeight,
       ).data;
+
+      const sampleCanvas = document.createElement("canvas");
+      sampleCanvas.width = analysisWidth;
+      sampleCanvas.height = analysisHeight;
+      const sampleContext = sampleCanvas.getContext(
+        "2d",
+        { willReadFrequently:true },
+      );
+      if (!sampleContext) throw new Error("Unable to read the painted hint.");
+      sampleContext.fillStyle = "#fff";
+      for (const seed of analysisSeeds) {
+        sampleContext.beginPath();
+        sampleContext.arc(
+          seed.x,
+          seed.y,
+          seed.radius,
+          0,
+          Math.PI * 2,
+        );
+        sampleContext.fill();
+      }
+      const samplePixels = sampleContext.getImageData(
+        0,
+        0,
+        analysisWidth,
+        analysisHeight,
+      ).data;
       const pixelCount = analysisWidth * analysisHeight;
-      let selectedCount = 0;
+      const pointSamples = analysisPaintPoints.map((point, pointIndex) => {
+        const searchRadius = Math.max(
+          1,
+          analysisSeeds[pointIndex]?.radius ?? 1,
+        );
+        const sampleLeft = Math.max(
+          0,
+          Math.floor(point.x - searchRadius),
+        );
+        const sampleTop = Math.max(
+          0,
+          Math.floor(point.y - searchRadius),
+        );
+        const sampleRight = Math.min(
+          analysisWidth - 1,
+          Math.ceil(point.x + searchRadius),
+        );
+        const sampleBottom = Math.min(
+          analysisHeight - 1,
+          Math.ceil(point.y + searchRadius),
+        );
+        let closestDistance = Number.POSITIVE_INFINITY;
+        let sample: {
+          red: number;
+          green: number;
+          blue: number;
+          luminance: number;
+          chroma: number;
+          model: number;
+        } | undefined;
+        for (let y = sampleTop; y <= sampleBottom; y += 1) {
+          for (let x = sampleLeft; x <= sampleRight; x += 1) {
+            const horizontalDistance = x + 0.5 - point.x;
+            const verticalDistance = y + 0.5 - point.y;
+            const distance = (
+              horizontalDistance * horizontalDistance
+              + verticalDistance * verticalDistance
+            );
+            if (
+              distance > searchRadius * searchRadius
+              || distance >= closestDistance
+            ) continue;
+            const index = y * analysisWidth + x;
+            const offset = index * 4;
+            if (visiblePixels[offset + 3] <= 4) continue;
+            const red = sourcePixels[offset];
+            const green = sourcePixels[offset + 1];
+            const blue = sourcePixels[offset + 2];
+            closestDistance = distance;
+            sample = {
+              red,
+              green,
+              blue,
+              luminance:red * 0.2126 + green * 0.7152 + blue * 0.0722,
+              chroma:Math.max(red, green, blue) - Math.min(red, green, blue),
+              model:resultPixels[index],
+            };
+          }
+        }
+        return sample;
+      });
+      if (!pointSamples.some(Boolean)) {
+        throw new Error("Paint over a visible area to create an AI selection.");
+      }
+      const strokeDistance = new Float64Array(analysisPaintPoints.length);
+      for (
+        let pointIndex = 1;
+        pointIndex < analysisPaintPoints.length;
+        pointIndex += 1
+      ) {
+        const point = analysisPaintPoints[pointIndex];
+        const previous = analysisPaintPoints[pointIndex - 1];
+        strokeDistance[pointIndex] = (
+          strokeDistance[pointIndex - 1]
+          + Math.hypot(point.x - previous.x, point.y - previous.y)
+        );
+      }
+      const totalStrokeDistance = (
+        strokeDistance[strokeDistance.length - 1] ?? 0
+      );
+      const nearestPoint = new Int32Array(pixelCount);
+      nearestPoint.fill(-1);
+      const nearestDistance = new Float32Array(pixelCount);
+      nearestDistance.fill(Number.POSITIVE_INFINITY);
+      for (
+        let pointIndex = 0;
+        pointIndex < analysisPaintPoints.length;
+        pointIndex += 1
+      ) {
+        if (!pointSamples[pointIndex]) continue;
+        const point = analysisPaintPoints[pointIndex];
+        const endpointDistance = Math.min(
+          strokeDistance[pointIndex],
+          totalStrokeDistance - strokeDistance[pointIndex],
+        );
+        const endpointProgress = totalStrokeDistance > 0
+          ? clamp(
+              endpointDistance
+                / Math.max(
+                  1,
+                  point.radius * MAGIC_ENDPOINT_TAPER_DISTANCE_SCALE,
+                ),
+              0,
+              1,
+            )
+          : 0.25;
+        const growthScale = (
+          MAGIC_ENDPOINT_GROWTH_RADIUS_SCALE
+          + (
+            MAGIC_GROWTH_RADIUS_SCALE
+            - MAGIC_ENDPOINT_GROWTH_RADIUS_SCALE
+          ) * endpointProgress
+        );
+        const radius = Math.max(
+          1,
+          point.radius * growthScale,
+        );
+        const growthLeft = Math.max(0, Math.floor(point.x - radius));
+        const growthTop = Math.max(0, Math.floor(point.y - radius));
+        const growthRight = Math.min(
+          analysisWidth - 1,
+          Math.ceil(point.x + radius),
+        );
+        const growthBottom = Math.min(
+          analysisHeight - 1,
+          Math.ceil(point.y + radius),
+        );
+        for (let y = growthTop; y <= growthBottom; y += 1) {
+          const normalizedY = (y + 0.5 - point.y) / radius;
+          for (let x = growthLeft; x <= growthRight; x += 1) {
+            const normalizedX = (x + 0.5 - point.x) / radius;
+            const distance = (
+              normalizedX * normalizedX + normalizedY * normalizedY
+            );
+            if (distance > 1) continue;
+            const index = y * analysisWidth + x;
+            if (distance >= nearestDistance[index]) continue;
+            nearestDistance[index] = distance;
+            nearestPoint[index] = pointIndex;
+          }
+        }
+      }
+
+      const candidates = new Uint8Array(pixelCount);
+      const softCandidates = new Uint8Array(pixelCount);
+      const selected = new Uint8Array(pixelCount);
+      const queue = new Int32Array(pixelCount);
+      let write = 0;
+
       for (let index = 0; index < pixelCount; index += 1) {
         const offset = index * 4;
+        const pointIndex = nearestPoint[index];
+        if (pointIndex < 0 || visiblePixels[offset + 3] <= 4) continue;
+        const pointSample = pointSamples[pointIndex];
+        if (!pointSample) continue;
+        const red = sourcePixels[offset];
+        const green = sourcePixels[offset + 1];
+        const blue = sourcePixels[offset + 2];
+        const redDifference = red - pointSample.red;
+        const greenDifference = green - pointSample.green;
+        const blueDifference = blue - pointSample.blue;
+        const colorDistanceSquared = (
+          redDifference * redDifference
+          + greenDifference * greenDifference
+          + blueDifference * blueDifference
+        );
+        const luminance = red * 0.2126 + green * 0.7152 + blue * 0.0722;
+        const chroma = Math.max(red, green, blue) - Math.min(red, green, blue);
+        const luminanceDifference = Math.abs(
+          luminance - pointSample.luminance,
+        );
+        const chromaDifference = Math.abs(chroma - pointSample.chroma);
+        const modelDifference = Math.abs(
+          resultPixels[index] - pointSample.model,
+        );
         if (
-          resultPixels[index] >= MAGIC_MASK_ALPHA_THRESHOLD
-          && visiblePixels[offset + 3] > 4
-        ) selectedCount += 1;
+          colorDistanceSquared
+            <= MAGIC_SOFT_COLOR_TOLERANCE
+              * MAGIC_SOFT_COLOR_TOLERANCE
+          && luminanceDifference <= MAGIC_SOFT_LUMINANCE_TOLERANCE
+          && chromaDifference <= MAGIC_SOFT_CHROMA_TOLERANCE
+          && modelDifference <= MAGIC_SOFT_MODEL_TOLERANCE
+        ) {
+          softCandidates[index] = 1;
+        }
+        if (
+          colorDistanceSquared
+            > MAGIC_POINT_COLOR_TOLERANCE * MAGIC_POINT_COLOR_TOLERANCE
+          || luminanceDifference > MAGIC_POINT_LUMINANCE_TOLERANCE
+          || chromaDifference > MAGIC_POINT_CHROMA_TOLERANCE
+          || modelDifference > MAGIC_POINT_MODEL_TOLERANCE
+        ) continue;
+        const isSampledHint = samplePixels[offset + 3] > 24;
+        candidates[index] = 1;
+        if (isSampledHint) {
+          selected[index] = 1;
+          queue[write] = index;
+          write += 1;
+        }
       }
-      if (!selectedCount) {
+      if (!write) {
         throw new Error(
           "The AI could not find a removable region under that hint.",
         );
+      }
+      const localColorToleranceSquared =
+        MAGIC_LOCAL_EDGE_COLOR_TOLERANCE
+        * MAGIC_LOCAL_EDGE_COLOR_TOLERANCE;
+      const addConnectedNeighbor = (
+        current: number,
+        neighbor: number,
+        allowed: Uint8Array,
+      ) => {
+        if (selected[neighbor] || !allowed[neighbor]) return;
+        const currentOffset = current * 4;
+        const neighborOffset = neighbor * 4;
+        const redDifference = (
+          sourcePixels[currentOffset] - sourcePixels[neighborOffset]
+        );
+        const greenDifference = (
+          sourcePixels[currentOffset + 1]
+          - sourcePixels[neighborOffset + 1]
+        );
+        const blueDifference = (
+          sourcePixels[currentOffset + 2]
+          - sourcePixels[neighborOffset + 2]
+        );
+        if (
+          redDifference * redDifference
+            + greenDifference * greenDifference
+            + blueDifference * blueDifference
+            > localColorToleranceSquared
+          || Math.abs(
+            visiblePixels[currentOffset + 3]
+              - visiblePixels[neighborOffset + 3],
+          ) > MAGIC_LOCAL_EDGE_ALPHA_TOLERANCE
+          || Math.abs(
+            resultPixels[current] - resultPixels[neighbor],
+          ) > MAGIC_LOCAL_EDGE_MODEL_TOLERANCE
+        ) return;
+        selected[neighbor] = 1;
+        queue[write] = neighbor;
+        write += 1;
+      };
+
+      for (let read = 0; read < write; read += 1) {
+        const index = queue[read];
+        const x = index % analysisWidth;
+        const y = Math.floor(index / analysisWidth);
+        if (x > 0) {
+          addConnectedNeighbor(index, index - 1, candidates);
+        }
+        if (x < analysisWidth - 1) {
+          addConnectedNeighbor(index, index + 1, candidates);
+        }
+        if (y > 0) {
+          addConnectedNeighbor(
+            index,
+            index - analysisWidth,
+            candidates,
+          );
+        }
+        if (y < analysisHeight - 1) {
+          addConnectedNeighbor(
+            index,
+            index + analysisWidth,
+            candidates,
+          );
+        }
+      }
+
+      const fillPixels = new Uint8Array(pixelCount);
+      for (let pass = 0; pass < MAGIC_HOLE_FILL_PASSES; pass += 1) {
+        let fillCount = 0;
+        for (let index = 0; index < pixelCount; index += 1) {
+          if (selected[index] || !softCandidates[index]) continue;
+          const x = index % analysisWidth;
+          const y = Math.floor(index / analysisWidth);
+          let selectedNeighbors = 0;
+          if (x > 0 && selected[index - 1]) selectedNeighbors += 1;
+          if (x < analysisWidth - 1 && selected[index + 1]) {
+            selectedNeighbors += 1;
+          }
+          if (y > 0 && selected[index - analysisWidth]) {
+            selectedNeighbors += 1;
+          }
+          if (y < analysisHeight - 1 && selected[index + analysisWidth]) {
+            selectedNeighbors += 1;
+          }
+          if (selectedNeighbors < 3) continue;
+          fillPixels[index] = 1;
+          fillCount += 1;
+        }
+        if (!fillCount) break;
+        for (let index = 0; index < pixelCount; index += 1) {
+          if (!fillPixels[index]) continue;
+          selected[index] = 1;
+          fillPixels[index] = 0;
+        }
       }
 
       const preview = document.createElement("canvas");
@@ -622,11 +970,8 @@ export function RefineEditor({
         analysisHeight,
       );
       for (let index = 0; index < pixelCount; index += 1) {
+        if (!selected[index]) continue;
         const offset = index * 4;
-        if (
-          resultPixels[index] < MAGIC_MASK_ALPHA_THRESHOLD
-          || visiblePixels[offset + 3] <= 4
-        ) continue;
         previewPixels.data[offset] = 83;
         previewPixels.data[offset + 1] = 218;
         previewPixels.data[offset + 2] = 190;
